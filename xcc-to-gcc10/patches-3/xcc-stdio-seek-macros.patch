@@ -1,0 +1,30 @@
+diff --git a/include/stdio.h b/include/stdio.h
+index c268ea9..26b8f00 100644
+--- a/include/stdio.h
++++ b/include/stdio.h
+@@ -6,11 +6,20 @@
+ 
+ #define EOF  (-1)
+ 
+-enum {
+-  SEEK_SET,  // 0
+-  SEEK_CUR,  // 1
+-  SEEK_END,  // 2
+-};
++/* C requires SEEK_SET/SEEK_CUR/SEEK_END to be MACROS (C99 7.19.1p3).  Defining
++   them as enumeration constants breaks any source that defines them as macros
++   before including <stdio.h>: the enum body then expands to `0, 1, 2` and the
++   parser reports "ident expected".  zlib's zconf.h does exactly that
++   (#ifndef SEEK_SET / #define SEEK_SET 0 ...).  */
++#ifndef SEEK_SET
++#define SEEK_SET  0
++#endif
++#ifndef SEEK_CUR
++#define SEEK_CUR  1
++#endif
++#ifndef SEEK_END
++#define SEEK_END  2
++#endif
+ 
+ typedef struct FILE FILE;
+ 

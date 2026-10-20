@@ -1,0 +1,16 @@
+diff --git a/src/cc/builtin.c b/src/cc/builtin.c
+index f747207..6b24e62 100644
+--- a/src/cc/builtin.c
++++ b/src/cc/builtin.c
+@@ -617,5 +617,11 @@ void install_builtins(Vector *decls) {
+     vec_push(params, &tySize);
+     Type *type = new_func_type(rettype, params, false);
+     add_builtin_function("alloca", type, &p_alloca, false);
++    // GCC's name for the same builtin. Code that probes whether
++    // `__builtin_alloca' is usable (autoconf's AC_FUNC_ALLOCA, GMP's
++    // gmp-impl.h, ...) only takes the builtin path when this name resolves;
++    // some libc <alloca.h> headers (musl) define alloca as `__builtin_alloca',
++    // so it must work and not be rejected as undeclared: add_to_scope=true (no header declares it).
++    add_builtin_function("__builtin_alloca", type, &p_alloca, true);
+   }
+ }

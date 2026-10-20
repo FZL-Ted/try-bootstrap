@@ -1,0 +1,23 @@
+diff --git a/include/stdarg.h b/include/stdarg.h
+--- a/include/stdarg.h
++++ b/include/stdarg.h
+@@ -67,11 +67,15 @@
+ 
+ //
+ 
++// NOTE: the local must NOT be named `p': this macro is used as
++// `va_arg(p, ty)` in real code (GCC's tree.c/calls.c/emit-rtl.c/... declare
++// `va_list p;`), and a local named `p` would shadow it inside the statement
++// expression, turning `(ap)->overflow_arg_area` into `->` on a `uintptr_t`.
+ #define __va_arg_mem(ap, sz, align) ({ \
+-  uintptr_t p = (uintptr_t)((ap)->overflow_arg_area); \
+-  if ((align) > 8)  p = (p + 15) / 16 * 16; \
+-  (ap)->overflow_arg_area = (void*)((p + (sz) + 7) & -8); \
+-  (char*)p; })
++  uintptr_t __va_p = (uintptr_t)((ap)->overflow_arg_area); \
++  if ((align) > 8)  __va_p = (__va_p + 15) / 16 * 16; \
++  (ap)->overflow_arg_area = (void*)((__va_p + (sz) + 7) & -8); \
++  (char*)__va_p; })
+ 
+ #define __va_arg_gp(ap, sz, align) \
+   ((ap)->gp_offset < __GP_OFFSET_MAX \

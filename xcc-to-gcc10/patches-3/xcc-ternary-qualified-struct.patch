@@ -1,0 +1,20 @@
+diff --git a/src/cc/frontend/fe_misc.c b/src/cc/frontend/fe_misc.c
+--- a/src/cc/frontend/fe_misc.c
++++ b/src/cc/frontend/fe_misc.c
+@@ -623,6 +623,16 @@
+     if (ftype->fixnum.kind >= FX_ENUM)
+       ftype = &tyInt;
+     return ttype->fixnum.kind > ftype->fixnum.kind ? ttype : ftype;
++  } else if (same_type_without_qualifier(ttype, ftype, true)) {
++    // C11 6.5.15p5: if both operands have the same structure/union type, the
++    // result has that (unqualified) type.  The `same_type()` test above is
++    // qualifier-sensitive, so `comp_cost` vs `const comp_cost` fell through to
++    // the NULL below even though the types are compatible.  GCC relies on it:
++    //   tree-ssa-loop-ivopts.c: origcost = origset ? iv_ca_cost (origset) : infinite_cost;
++    // with `static const comp_cost infinite_cost` and iv_ca_cost() returning a
++    // plain `comp_cost`.  (Reached only when neither side is a pointer and they
++    // are not both numbers.)
++    return (ftype->qualifier & TQ_CONST) == 0 ? ftype : ttype;
+   }
+   return NULL;
+ }

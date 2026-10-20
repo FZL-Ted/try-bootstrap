@@ -1,0 +1,22 @@
+diff --git a/src/cc/frontend/parser_expr.c b/src/cc/frontend/parser_expr.c
+index 660a75c..8eb8a41 100644
+--- a/src/cc/frontend/parser_expr.c
++++ b/src/cc/frontend/parser_expr.c
+@@ -285,8 +285,16 @@ static Expr *literal(Token *tok) {
+           }
+           ++fx;
+         }
+-        if (!u && fx >= FX_LLONG) {
++        if (!u && fx >= FX_LLONG &&
++            (tok->fixnum.flag & TKF_KIND_MASK) != 0) {
+           // Check auto upgrade to unsigned.
++          // N.B. C99 6.4.4.1p5: only hexadecimal/octal constants may become
++          // unsigned.  A decimal constant too large for long long stays SIGNED.
++          // Making it unsigned silently turns comparisons such as
++          // (x <= LONG_MIN + 3) into unsigned comparisons -- LONG_MIN is the
++          // decimal literal -9223372036854775808L in xcc's own limits.h, so
++          // e.g. MPFR's MPFR_IS_SINGULAR(x) became always true and the whole
++          // library produced wrong results.
+           Type *type = get_fixnum_type(fx, u, 0);
+           int bits = type_size(type) * TARGET_CHAR_BIT - (u ? 0 : 1);
+           if (value > (((UFixnum)1 << bits) - 1))

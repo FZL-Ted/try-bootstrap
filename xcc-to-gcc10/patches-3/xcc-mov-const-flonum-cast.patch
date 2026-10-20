@@ -1,0 +1,26 @@
+diff --git a/src/cc/backend/codegen_expr.c b/src/cc/backend/codegen_expr.c
+--- a/src/cc/backend/codegen_expr.c
++++ b/src/cc/backend/codegen_expr.c
+@@ -192,6 +192,22 @@
+   }
+ 
+   size_t dst_size = type_size(dst_type);
++#ifndef __NO_FLONUM
++  if ((vreg->flag & (VRF_CONST | VRF_FLONUM)) == (VRF_CONST | VRF_FLONUM)) {
++    // Constant **flonum** source: materialise it into a register and let the
++    // ordinary conversion path handle it.  Reached e.g. from a chained
++    // assignment whose middle target is floating point:
++    //     unsigned long n; double s;  n = s = 0;
++    // the value of `(s = 0)` is the constant flonum vreg of `(double)0`, and
++    // the enclosing implicit cast `(unsigned long)` then sees a const flonum.
++    // Do NOT evaluate the conversion here (the C cast of an out-of-range
++    // double is undefined; being consistent with the runtime `cvttsd2si`
++    // truncation is what we want).  ei_cast() also requires a non-const opr1.
++    VReg *tmp = reg_alloc_spawn(curra, vreg->vsize, vreg->flag & VRF_MASK);
++    new_ir_mov(tmp, vreg);
++    vreg = tmp;
++  }
++#endif
+   if (vreg->flag & VRF_CONST) {
+     assert(!(vreg->flag & VRF_FLONUM));  // No const vreg for flonum.
+     Fixnum value = vreg->fixnum;

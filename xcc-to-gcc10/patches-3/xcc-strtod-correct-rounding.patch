@@ -1,0 +1,519 @@
+diff --git a/libsrc/stdlib/strtod.c b/libsrc/stdlib/strtod.c
+index 6ff80ff..7898be1 100644
+--- a/libsrc/stdlib/strtod.c
++++ b/libsrc/stdlib/strtod.c
+@@ -3,11 +3,260 @@
+ #include "stdbool.h"
+ #include "string.h"
+ #include "stdint.h"
+-#include "../math/_ieee.h"
+ 
+ extern bool _parse_sign(const char **pp);
+ 
+ #ifndef __NO_FLONUM
++
++/* ========================= Exact conversion of decimal float literals =========================
++ *
++ * The old implementation (accumulate `result*10+digit` as double, then scale by repeated squaring via `ipow(10,n)`)
++ * was correct only for small |exponent| and at most 15 significant digits:
++ *   - `2.2250738585072014e-308` was off by about 5 ulp;
++ *   - `4.94065645841246544177e-324` (DBL_TRUE_MIN) underflowed to 0.
++ * Such literals are common in real code (DBL_MIN / DBL_TRUE_MIN / FLT_MAX ...),
++ * and libraries such as MPFR use them as expected values.
++ *
++ * This version performs an **exact** conversion: collect the significant digits into a big integer D, giving `value = D * 10^exp10`,
++ * then turn that into the exact fraction `num / den` with big integers:
++ *     exp10 >= 0 :  num = D * 10^exp10,  den = 1
++ *     exp10 <  0 :  num = D,             den = 10^(-exp10)
++ * Then do a long division with remainder, keep 57 quotient bits, and use "remainder != 0" as the sticky bit
++ * to round to 53 bits with round-to-nearest-even (subnormals round at the available precision).
++ * The result is **correctly rounded** and uses no intermediate floating-point arithmetic.
++ *
++ * Limits: at most MAX_DIGITS decimal significant digits; big integers have BIG_LIMBS 32-bit limbs.
++ * A decimal-magnitude overflow/underflow short-circuit runs first so the big integers stay bounded.
++ * ========================================================================== */
++
++#define BIG_LIMBS   96    /* 96*32 = 3072 bits: enough for 256 significant digits + 10^±580 */
++#define MAX_DIGITS  256
++
++typedef struct {
++  uint32_t v[BIG_LIMBS];  /* little-endian: v[0] is the least significant 32 bits */
++  int len;                /* number of significant limbs; 0 means zero */
++} Big;
++
++static void big_zero(Big *a) { a->len = 0; }
++static bool big_is_zero(const Big *a) { return a->len == 0; }
++
++static int bitlen64(uint64_t x) {
++  int n = 0;
++  while (x != 0) {
++    ++n;
++    x >>= 1;
++  }
++  return n;
++}
++
++static int big_bitlen(const Big *a) {
++  uint32_t t;
++  int b = 0;
++  if (a->len == 0)
++    return 0;
++  t = a->v[a->len - 1];
++  while (t != 0) {
++    ++b;
++    t >>= 1;
++  }
++  return (a->len - 1) * 32 + b;
++}
++
++static void big_mul_small(Big *a, uint32_t m) {
++  uint64_t carry = 0;
++  int i;
++  for (i = 0; i < a->len; ++i) {
++    uint64_t t = (uint64_t)a->v[i] * m + carry;
++    a->v[i] = (uint32_t)t;
++    carry = t >> 32;
++  }
++  if (carry != 0 && a->len < BIG_LIMBS)
++    a->v[a->len++] = (uint32_t)carry;
++}
++
++static void big_add_small(Big *a, uint32_t m) {
++  uint64_t carry = m;
++  int i;
++  for (i = 0; i < a->len && carry != 0; ++i) {
++    uint64_t t = (uint64_t)a->v[i] + carry;
++    a->v[i] = (uint32_t)t;
++    carry = t >> 32;
++  }
++  if (carry != 0 && a->len < BIG_LIMBS)
++    a->v[a->len++] = (uint32_t)carry;
++}
++
++/* a *= 10^k */
++static void big_mul_pow10(Big *a, long k) {
++  long i;
++  for (i = 0; i < k; ++i)
++    big_mul_small(a, 10);
++}
++
++static void big_shl(Big *a, int bits) {
++  int words, sb, i;
++  if (a->len == 0 || bits <= 0)
++    return;
++  words = bits >> 5;
++  sb = bits & 31;
++  if (words != 0) {
++    if (a->len + words > BIG_LIMBS)
++      a->len = BIG_LIMBS - words;  /* should not happen (magnitude short-circuit above) */
++    for (i = a->len - 1; i >= 0; --i)
++      a->v[i + words] = a->v[i];
++    for (i = 0; i < words; ++i)
++      a->v[i] = 0;
++    a->len += words;
++  }
++  if (sb != 0) {
++    uint32_t carry = 0;
++    for (i = 0; i < a->len; ++i) {
++      uint32_t nv = (uint32_t)((a->v[i] << sb) | carry);
++      carry = a->v[i] >> (32 - sb);
++      a->v[i] = nv;
++    }
++    if (carry != 0 && a->len < BIG_LIMBS)
++      a->v[a->len++] = carry;
++  }
++}
++
++static void big_shr1(Big *a) {
++  uint32_t carry = 0;
++  int i;
++  for (i = a->len; i-- > 0;) {
++    uint32_t nv = (a->v[i] >> 1) | (carry << 31);
++    carry = a->v[i] & 1u;
++    a->v[i] = nv;
++  }
++  while (a->len > 0 && a->v[a->len - 1] == 0)
++    --a->len;
++}
++
++static int big_cmp(const Big *a, const Big *b) {
++  int i;
++  if (a->len != b->len)
++    return a->len < b->len ? -1 : 1;
++  for (i = a->len; i-- > 0;) {
++    if (a->v[i] != b->v[i])
++      return a->v[i] < b->v[i] ? -1 : 1;
++  }
++  return 0;
++}
++
++/* a -= b; requires a >= b */
++static void big_sub(Big *a, const Big *b) {
++  int32_t borrow = 0;
++  int i;
++  for (i = 0; i < a->len; ++i) {
++    int64_t t = (int64_t)a->v[i] - (i < b->len ? (int64_t)b->v[i] : 0) - borrow;
++    if (t < 0) {
++      t += ((int64_t)1 << 32);
++      borrow = 1;
++    } else {
++      borrow = 0;
++    }
++    a->v[i] = (uint32_t)t;
++  }
++  while (a->len > 0 && a->v[a->len - 1] == 0)
++    --a->len;
++}
++
++static double u64_to_double(uint64_t bits) {
++  union {
++    uint64_t u;
++    double d;
++  } x;
++  x.u = bits;
++  return x.d;
++}
++/* Correctly round num/den to double (num and den are exact positive integers). */
++static double big_to_double(const Big *num, const Big *den, bool neg) {
++  Big a, b, bs;
++  uint64_t q = 0;
++  int bn = big_bitlen(num), bd = big_bitlen(den);
++  int s = bd + 56 - bn;
++  int i, nb, qtop, prec, ulp, shift, top;
++  bool sticky;
++  uint64_t m, bits;
++  double inf = 1.0 / 0.0;
++
++  a = *num;
++  b = *den;
++  if (s >= 0)
++    big_shl(&a, s);
++  else
++    big_shl(&b, -s);
++
++  /* Long division: q = floor(a / b), keeping 57 bits (top bit index 56). */
++  bs = b;
++  big_shl(&bs, 56);
++  for (i = 56; i >= 0; --i) {
++    if (big_cmp(&a, &bs) >= 0) {
++      big_sub(&a, &bs);
++      q |= ((uint64_t)1) << i;
++    }
++    big_shr1(&bs);
++  }
++  sticky = !big_is_zero(&a);
++  nb = bitlen64(q);
++
++  /* value = q * 2^-s. Choose precision and ulp exponent from the unrounded magnitude. */
++  qtop = nb - 1 - s;
++  if (qtop >= -1022) {
++    prec = 53;
++  } else {
++    prec = qtop + 1075;  /* qtop + 1074 + 1: available subnormal bits */
++    if (prec < 1)
++      prec = 1;
++  }
++  ulp = qtop - prec + 1;
++  if (ulp < -1074) {
++    ulp = -1074;
++    prec = qtop + 1075;
++    if (prec < 1)
++      prec = 1;
++  }
++
++  /* Round q to prec bits (round-to-nearest-even: low bits and the remainder decide).
++     Right-shift amount = s + ulp (value = q*2^-s; target quantum is 2^ulp).
++     Note that after ulp is clamped to -1074 this is no longer nb-prec -- use it as is,
++     otherwise a value like 1e-324, smaller than DBL_TRUE_MIN, becomes 2*DBL_TRUE_MIN. */
++  shift = s + ulp;
++  if (shift <= 0) {
++    m = q << (-shift);
++  } else {
++    uint64_t dropped = q & ((((uint64_t)1) << shift) - 1);
++    uint64_t half = ((uint64_t)1) << (shift - 1);
++    m = q >> shift;
++    if (dropped > half || (dropped == half && (sticky || (m & 1) != 0)))
++      ++m;
++  }
++  /* m gains a bit only on an exact carry, in which case a one-bit shift is exact. */
++  while (m != 0 && bitlen64(m) > 53) {
++    m >>= 1;
++    ++ulp;
++  }
++  if (m == 0)
++    return neg ? -0.0 : 0.0;
++
++  top = ulp + bitlen64(m) - 1;  /* binary exponent of the most significant bit */
++  if (top > 1023)
++    return neg ? -inf : inf;
++  if (top >= -1022) {
++    int l = 53 - bitlen64(m);
++    uint64_t mant = m << l;
++    uint64_t e = (uint64_t)(top + 1023);
++    bits = (e << 52) | (mant & ((((uint64_t)1) << 52) - 1));
++  } else {
++    bits = m;  /* subnormal: ulp == -1074 here, so m is the mantissa field directly */
++  }
++  if (neg)
++    bits |= ((uint64_t)1) << 63;
++  return u64_to_double(bits);
++}
++
++/* ============================== Hexadecimal floats ============================== */
++
+ static double ipow(double base, long x) {
+   double result = 1;
+   double a = base;
+@@ -18,36 +267,21 @@ static double ipow(double base, long x) {
+   return result;
+ }
+ 
+-static double strtod_i(const char *p, const char **pp) {
+-  double result = 0;
+-  for (;; ++p) {
+-    char c = *p;
+-    if (!(c >= '0' && c <= '9'))
+-      break;
+-    result = result * 10 + (c - '0');
+-  }
+-  *pp = p;
+-  return result;
+-}
+-
+-static double strtod_i2(const char *p, const char **pp) {
+-  const char *q = p, *r = p;
+-  for (;;) {
+-    char c = *q;
+-    if (!(c >= '0' && c <= '9'))
+-      break;
+-    ++q;
+-    if (c != '0')
+-      r = q;
++/* v * 2^n, applied in blocks of |k| <= 1000 so ipow(2, n) itself does not overflow/underflow first
++   (otherwise 0x1p-1074 becomes 0 and 0x1p1024 becomes inf, which is wrong).
++   2^1000 is exactly representable, so every block is exact; only the last step may land in the subnormal range and round correctly. */
++static double scale_pow2(double v, long n) {
++  while (n > 0) {
++    long k = n > 1000 ? 1000 : n;
++    v *= ipow(2, k);
++    n -= k;
+   }
+-
+-  double result = 0;
+-  for (size_t order = r - p; r > p; --order) {
+-    char c = *(--r);
+-    result += (c - '0') / ipow(10, order);
++  while (n < 0) {
++    long k = n < -1000 ? 1000 : -n;
++    v /= ipow(2, k);
++    n += k;
+   }
+-  *pp = q;
+-  return result;
++  return v;
+ }
+ 
+ #define strtod_h(p, pp)  strtoull(p, (char**)(pp), 16)
+@@ -63,79 +297,155 @@ static double strtod_hex(const char *p, const char **pp) {
+   if (tolower(*p) == 'p') {
+     const char *q = p + 1;
+     bool neg2 = _parse_sign(&q);
+-    double order = strtod_i(q, &p);
+-    if (q == p) {
+-      // Error.
+-    } else {
+-      double k = ipow(2, order);
+-      if (neg2)
+-        result /= k;
+-      else
+-        result *= k;
++    const char *q0 = q;
++    long ev = 0;
++    while (isdigit((unsigned char)*q)) {
++      if (ev < 1000000L)
++        ev = ev * 10 + (*q - '0');
++      ++q;
++    }
++    if (q != q0) {
++      p = q;
++      result = scale_pow2(result, neg2 ? -ev : ev);
+     }
+   }
+   *pp = p;
+   return result;
+ }
+ 
++/* ================================= strtod ================================= */
++
+ double strtod(const char *restrict p_, char **restrict pp) {
+   const char *p = p_;
+   const char *orig = p;
++  bool neg;
++  double result;
++  Big D;
++  long exp10 = 0;
++  int ndig = 0;
++  bool seen_digit = false, seen_nonzero = false;
++  const char *op;
++  /* Build inf/nan directly from IEEE-754 binary64 bit patterns:
++     this avoids depending on constant-folded `1.0/0.0` and `0.0/0.0`, whose **sign bit**
++     is implementation-defined (xcc folds to a negative NaN, glibc to a positive NaN), so it is unreliable for negatives. */
++  static const char *const CONST[] = {"infinity", "inf", "nan"};
++  int ci;
+ 
+-  for (; isspace(*p); ++p)
++  for (; isspace((unsigned char)*p); ++p)
+     ;
++  neg = _parse_sign(&p);
+ 
+-  bool neg = _parse_sign(&p);
+-
+-  static const struct {
+-    const char *str;
+-    double pos, neg;
+-  } CONST[] = {
+-    {"infinity", 1.0 / 0.0, -1.0 / 0.0},
+-    {"inf", 1.0 / 0.0, -1.0 / 0.0},
+-    {"nan", 0.0 / 0.0, 0.0 / 0.0},
+-  };
+-  for (int i = 0; i < (int)(sizeof(CONST) / sizeof(*CONST)); ++i) {
+-    const char *str = CONST[i].str;
++  for (ci = 0; ci < (int)(sizeof(CONST) / sizeof(*CONST)); ++ci) {
++    const char *str = CONST[ci];
+     size_t len = strlen(str);
+     if (strncmp(p, str, len) == 0) {
++      /* Exponent bits all 1; mantissa 0 => inf, top mantissa bit 1 => quiet NaN. */
++      uint64_t bits = (str[0] == 'n') ? (((uint64_t)0x7ff8) << 48)
++                                      : (((uint64_t)0x7ff0) << 48);
+       p += len;
+       if (pp != 0)
+         *pp = (char*)p;
+-      return neg ? CONST[i].neg : CONST[i].pos;
++      if (neg)
++        bits |= ((uint64_t)1) << 63;
++      return u64_to_double(bits);
+     }
+   }
+ 
+-  const char *op;
+-  double result;
+-  if (p[0] == '0' && tolower(p[1]) == 'x') {
++  if (p[0] == '0' && tolower((unsigned char)p[1]) == 'x') {
+     op = p += 2;
+     result = strtod_hex(p, &p);
+-  } else {
+-    op = p;
+-    result = strtod_i(p, &p);
+-    if (*p == '.') {
+-      const char *q = p + 1;
+-      double frac = strtod_i2(q, &p);
+-      result += frac;
++    if (p == op)
++      p = orig;
++    if (neg)
++      result = -result;
++    if (pp != NULL)
++      *pp = (char*)p;
++    return result;
++  }
++
++  /* Collect the significant digits into an exact big integer. */
++  big_zero(&D);
++  while (isdigit((unsigned char)*p)) {
++    seen_digit = true;
++    if (!seen_nonzero && *p == '0') {
++      ++p;
++      continue;  /* leading zeros do not enter D */
+     }
+-    if (tolower(*p) == 'e') {
+-      const char *q = p + 1;
+-      bool neg2 = _parse_sign(&q);
+-      double order = strtod_i(q, &p);
+-      if (q == p) {
+-        // Error.
+-      } else {
+-        double k = ipow(10, order);
+-        if (neg2)
+-          result /= k;
+-        else
+-          result *= k;
++    seen_nonzero = true;
++    if (ndig < MAX_DIGITS) {
++      big_mul_small(&D, 10);
++      big_add_small(&D, (uint32_t)(*p - '0'));
++      ++ndig;
++    } else {
++      ++exp10;  /* integer digits beyond the precision only raise the exponent */
++    }
++    ++p;
++  }
++  if (*p == '.') {
++    ++p;
++    while (isdigit((unsigned char)*p)) {
++      seen_digit = true;
++      if (!seen_nonzero && *p == '0') {
++        --exp10;  /* leading zeros after the decimal point only affect the exponent */
++        ++p;
++        continue;
++      }
++      seen_nonzero = true;
++      if (ndig < MAX_DIGITS) {
++        big_mul_small(&D, 10);
++        big_add_small(&D, (uint32_t)(*p - '0'));
++        ++ndig;
++        --exp10;
+       }
++      ++p;
++    }
++  }
++  /* Decimal exponent: parse it as an integer and clamp it to avoid overflow. */
++  if (seen_digit && tolower((unsigned char)*p) == 'e') {
++    const char *q = p + 1;
++    bool neg2 = _parse_sign(&q);
++    const char *q0 = q;
++    long ev = 0;
++    while (isdigit((unsigned char)*q)) {
++      if (ev < 1000000L)
++        ev = ev * 10 + (*q - '0');
++      ++q;
++    }
++    if (q != q0) {
++      exp10 += neg2 ? -ev : ev;
++      p = q;
++    }
++  }
++  if (exp10 > 100000L)
++    exp10 = 100000L;
++  if (exp10 < -100000L)
++    exp10 = -100000L;
++
++  if (!seen_digit) {
++    p = orig;  /* no digits read: not a conversion */
++    result = 0.0;
++  } else if (big_is_zero(&D)) {
++    result = 0.0;
++  } else {
++    long mag_lo = (long)ndig - 1 + exp10;  /* value >= 10^mag_lo */
++    long mag_hi = (long)ndig + exp10;      /* value <  10^mag_hi */
++    if (mag_lo > 309) {
++      result = 1.0 / 0.0;  /* must overflow */
++    } else if (mag_hi < -324) {
++      result = 0.0;        /* must underflow to 0 */
++    } else {
++      Big num, den;
++      num = D;
++      big_zero(&den);
++      den.v[0] = 1;
++      den.len = 1;
++      if (exp10 >= 0)
++        big_mul_pow10(&num, exp10);
++      else
++        big_mul_pow10(&den, -exp10);
++      result = big_to_double(&num, &den, false);
+     }
+   }
+-  if (p == op)
+-    p = orig;
+   if (neg)
+     result = -result;
+ 

@@ -1,0 +1,56 @@
+diff --git a/src/cc/backend/regalloc.c b/src/cc/backend/regalloc.c
+index 0000000..0000000 100644
+--- a/src/cc/backend/regalloc.c
++++ b/src/cc/backend/regalloc.c
+@@ -122,21 +122,49 @@ static int sort_live_interval(const void *pa, const void *pb) {
+     if (d == 0)
+       d = a->virt - b->virt;
+   }
+   return d;
+ }
+ 
++// Whether `li` is pinned to a specific physical register.  Inline asm operands
++// with a register constraint ("D", "S", "d", ...) and GNU register variables
++// (`register long r10 __asm__("r10")`) must be exactly in that register when the
++// template runs, so their assignment cannot be moved or taken away.
++static bool is_pinned_interval(RegAlloc *ra, LiveInterval *li) {
++  VReg *vreg = ra->vregs->data[li->virt];
++  return vreg != NULL && (vreg->flag & VRF_FIXED_REG) != 0 && vreg->fixed_reg_index >= 0;
++}
++
+ static void split_at_interval(RegAlloc *ra, LiveInterval **active, int active_count,
+                               LiveInterval *li) {
+   assert(active_count > 0);
+-  LiveInterval *spill = active[active_count - 1];
++  // Pick a victim among the active intervals -- but never a pinned one.  Stealing
++  // a pinned operand's register silently breaks the inline asm it belongs to
++  // (the operand's value would end up somewhere else, while the template, or a
++  // fixed register constraint on another operand, still reads that register).
++  // Registers held by pinned intervals are hard constraints: when nothing else
++  // can be taken, the incoming interval is the one that spills.
++  int victim_index = -1;
++  for (int i = active_count; --i >= 0;) {
++    if (!is_pinned_interval(ra, active[i])) {
++      victim_index = i;
++      break;
++    }
++  }
++  if (victim_index < 0) {
++    // Everything active is pinned; spill the incoming interval instead.
++    li->phys = ra->settings->regset[GPREG].phys_max;
++    li->state = LI_SPILL;
++    return;
++  }
++  LiveInterval *spill = active[victim_index];
+   if (spill->end > li->end) {
+     li->phys = spill->phys;
+     spill->phys = ra->settings->regset[GPREG].phys_max;
+     spill->state = LI_SPILL;
+-    insert_active(active, active_count - 1, li);
++    insert_active(active, victim_index, li);
+   } else {
+     li->phys = ra->settings->regset[GPREG].phys_max;
+     li->state = LI_SPILL;
+   }
+ }
+ 

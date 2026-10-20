@@ -1,0 +1,50 @@
+diff --git a/src/cc/frontend/expr.c b/src/cc/frontend/expr.c
+index b139c3b..b6748a2 100644
+--- a/src/cc/frontend/expr.c
++++ b/src/cc/frontend/expr.c
+@@ -1202,8 +1202,19 @@ Expr *make_expr_cmp(enum ExprKind kind, const Token *tok, Expr *lhs, Expr *rhs)
+     Type *lt = lhs->type, *rt = rhs->type;
+     if (is_number(lt) && is_number(rt)) {
+       bool make_int = false;
++      bool do_cast_numbers = true;
+       if (is_fixnum(lt) && is_fixnum(rt)) {
+-        if (lc || rc) {
++        if (lc && rc) {
++          // Both operands are constants: do NOT use the "cast the constant to the
++          // other operand's type" shortcut below.  That shortcut assumes the other
++          // operand is non-constant, and when both are constants it picks the type
++          // of the *other constant*: a wider constant then gets truncated, e.g.
++          //   4294967296LL < 1   was folded to true   (truncated to int 0)
++          //   3000000000L < 1    was folded to true
++          //   LONG_MIN < 0       was folded to false
++          // Let the usual arithmetic conversions (cast_numbers) pick the common
++          // type first.
++        } else if (lc || rc) {
+           Expr **pLhs = &lhs, **pRhs = &rhs;
+           if (lc) {  // Make rhs const.
+             pLhs = &rhs, pRhs = &lhs;
+@@ -1217,15 +1228,21 @@ Expr *make_expr_cmp(enum ExprKind kind, const Token *tok, Expr *lhs, Expr *rhs)
+             dst_type = rtype;
+             *pLhs = make_cast(dst_type, (*pLhs)->token, *pLhs, false);
+           }
+-          // Cast constant as non-const type.
+-          *pRhs = make_cast(dst_type, (*pRhs)->token, *pRhs, false);
++          if (type_size(dst_type) >= type_size(rtype)) {
++            // Cast constant as non-const type.
++            *pRhs = make_cast(dst_type, (*pRhs)->token, *pRhs, false);
++            do_cast_numbers = false;
++          }
++          // Otherwise the constant is wider than the other operand: casting it down
++          // would truncate it (e.g. `int_var < 4294967296LL`), so fall through to the
++          // usual arithmetic conversions, which keep the wider type.
+         } else {
+           bool lu = lt->fixnum.is_unsigned;
+           bool ru = rt->fixnum.is_unsigned;
+           make_int = lu != ru && kind > EX_NE;
+         }
+       }
+-      if (!(is_fixnum(lt) && is_fixnum(rt)) || !(lc || rc)) {
++      if (do_cast_numbers) {
+         if (!cast_numbers(&lhs, &rhs, make_int)) {
+           parse_error(PE_NOFATAL, tok, "cannot compare except numbers");
+           return new_expr_fixlit(&tyBool, tok, 0);

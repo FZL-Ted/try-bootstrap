@@ -1,0 +1,50 @@
+diff --git a/src/cc/frontend/parser.c b/src/cc/frontend/parser.c
+index 9721107..0aa88b0 100644
+--- a/src/cc/frontend/parser.c
++++ b/src/cc/frontend/parser.c
+@@ -1058,6 +1058,15 @@ static void parse_global_var_decl(ParsedTypeInfo *tinfo, Type *type, Vector *dec
+         // Check LBRACE?
+       } else {
+         bool has_initializer = match(TK_ASSIGN) != NULL;
++        // C11 6.9.2p2: at file scope a declaration with `extern` **and** an
++        // initializer is a *definition* (only block scope forbids the
++        // combination, and that is diagnosed in check_vardecl()).  GCC's own
++        // sources rely on this, e.g.
++        //   c-family/c-opts.c:  extern const unsigned int c_family_lang_mask = (...);
++        // so drop the extern-ness here, before the variable gets registered.
++        bool extern_with_init = has_initializer && (tinfo->storage & VS_EXTERN) != 0;
++        if (extern_with_init)
++          tinfo->storage &= ~VS_EXTERN;
+         if (tinfo->ident != NULL) {
+           varinfo = add_var_to_scope(global_scope, tinfo->ident, type, tinfo->storage,
+                                      !has_initializer);
+@@ -1074,8 +1083,27 @@ static void parse_global_var_decl(ParsedTypeInfo *tinfo, Type *type, Vector *dec
+         }
+ 
+         if (tinfo->ident != NULL && varinfo != NULL) {
+-          varinfo->global.init = check_vardecl(&type, tinfo->ident, tinfo->storage, init);
+-          varinfo->type = type;  // type might be changed.
++          if (!has_initializer && varinfo->global.init != NULL) {
++            // A **repeat declaration** of an object that this translation unit
++            // already defined, e.g. the usual gengtype pattern
++            //     const struct ggc_root_tab gt_x[] = { ... };   /* definition  */
++            //     extern const struct ggc_root_tab gt_x[];      /* re-declared */
++            // (`init` above was picked up from the *definition*, not from this
++            // declaration.)  Handing that initializer to check_vardecl() would
++            // trip its "extern with initializer" diagnostic even though this
++            // declaration carries no initializer at all - C11 6.9.2p2 only
++            // constrains a declaration that itself has one.  Keep the already
++            // computed type (array length was fixed by the definition) and the
++            // definition's initializer; nothing to check here.
++            UNUSED(init);
++          } else {
++            varinfo->global.init = check_vardecl(&type, tinfo->ident, tinfo->storage, init);
++            varinfo->type = type;  // type might be changed.
++          }
++          // The variable may already exist (a previous `extern` declaration in
++          // a header): this declaration defines it, so clear VS_EXTERN there too.
++          if (extern_with_init)
++            varinfo->storage &= ~VS_EXTERN;
+         }
+         curvarinfo = NULL;
+       }

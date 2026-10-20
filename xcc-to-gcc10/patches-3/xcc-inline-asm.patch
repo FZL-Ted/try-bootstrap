@@ -1,0 +1,2159 @@
+diff --git a/Makefile b/Makefile
+index e3e731e..8873680 100644
+--- a/Makefile
++++ b/Makefile
+@@ -180,7 +180,8 @@ ifeq ("$(LIBS)", "")
+ libs: exes
+ else
+ libs: exes
+-	$(MAKE) CC=../xcc HOST_CC_PREFIX=$(HOST_CC_PREFIX) -C libsrc
++	$(MAKE) CC=../xcc HOST_CC_PREFIX=$(HOST_CC_PREFIX) \
++		PARENT_DEPS="$(addprefix ../,$(EXES))" -C libsrc
+ endif
+ 
+ ### Self hosting
+@@ -338,7 +339,7 @@ dump_ir_SRCS:=$(DEBUG_DIR)/dump_ir.c $(CC1_FE_DIR)/parser_expr.c $(CC1_FE_DIR)/p
+ 	$(CC1_FE_DIR)/ast.c $(CC1_FE_DIR)/var.c $(CC1_FE_DIR)/cc_misc.c \
+ 	$(CC1_BE_DIR)/codegen_expr.c $(CC1_BE_DIR)/codegen.c $(CC1_BE_DIR)/ir.c \
+ 	$(CC1_BE_DIR)/optimize.c $(CC1_BE_DIR)/ssa.c $(CC1_BE_DIR)/regalloc.c \
+-	$(CC1_DIR)/builtin.c $(CC1_ARCH_DIR)/emit_code.c \
++	$(CC1_DIR)/builtin.c $(CC1_ARCH_DIR)/emit_code.c $(CC1_ARCH_DIR)/asm_constraint.c \
+ 	$(CC1_ARCH_DIR)/ir_$(ARCHTYPE).c $(CC1_ARCH_DIR)/emit_$(ARCHTYPE).c \
+ 	$(UTIL_DIR)/util.c $(UTIL_DIR)/table.c
+ 
+diff --git a/src/as/arch/x64/asm_code.c b/src/as/arch/x64/asm_code.c
+index f0b0b6f..0056a45 100644
+--- a/src/as/arch/x64/asm_code.c
++++ b/src/as/arch/x64/asm_code.c
+@@ -285,8 +285,18 @@ static unsigned char *asm_mov_sr(Inst *inst, Code *code) {
+     Expr *offset = inst->opr[0].segment.offset;
+     if (offset == NULL || offset->kind == EX_FIXNUM) {
+       uint64_t value = offset == NULL ? 0 : offset->fixnum;
++      // `mov %fs:<offset>, %reg`.  This used to be a hardcoded
++      // `mov %fs:0x0,%rax` (ModRM 0x04 = reg field 0 + SIB byte), so a
++      // destination other than %rax was silently ignored.  The destination
++      // goes in the ModRM reg field (and REX.R for %r8..%r15) and must be
++      // encoded.
++      unsigned int dstno = inst->opr[1].reg.no;
+       short buf[] = {
+-        0x64, 0x48, 0x8b, 0x04, 0x25,
++        0x64,                                // %fs
++        (short)(0x48 | ((dstno >> 3) & 1)),  // REX.W | REX.R
++        0x8b,                                // mov r64, r/m64
++        (short)(0x04 | ((dstno & 7) << 3)),  // ModRM: mod=00, reg=dst, rm=100 (SIB)
++        0x25,                                // SIB: base=none, index=none, scale=1
+       };
+       unsigned char *p = code->buf;
+       p = put_code_filtered(p, buf, ARRAY_SIZE(buf));
+@@ -1007,8 +1017,14 @@ static unsigned char *asm_sub_srr(Inst *inst, Code *code) {
+     Expr *offset = inst->opr[0].segment.offset;
+     if (offset == NULL || offset->kind == EX_FIXNUM) {
+       uint64_t value = offset == NULL ? 0 : offset->fixnum;
++      // `sub %fs:<offset>, %reg`: same hardcoded-ModRM problem as asm_mov_sr.
++      unsigned int dstno = inst->opr[1].reg.no;
+       short buf[] = {
+-        0x64, 0x48, 0x2b, 0x04, 0x25,
++        0x64,                                // %fs
++        (short)(0x48 | ((dstno >> 3) & 1)),  // REX.W | REX.R
++        0x2b,                                // sub r64, r/m64
++        (short)(0x04 | ((dstno & 7) << 3)),  // ModRM: mod=00, reg=dst, rm=100 (SIB)
++        0x25,                                // SIB: base=none, index=none, scale=1
+       };
+       unsigned char *p = code->buf;
+       p = put_code_filtered(p, buf, ARRAY_SIZE(buf));
+@@ -1385,6 +1401,148 @@ static unsigned char *asm_cqto(Inst *inst, Code *code) {
+   return code->buf;
+ }
+ 
++// Emit "<op> r/m, r" (ModRM.reg = source register, r/m = destination).
++// `opcode2` < 0 selects a one byte opcode, otherwise a 0x0f prefixed opcode.
++static unsigned char *asm_rm_r(Inst *inst, Code *code, unsigned char opcode, int opcode2) {
++  const Operand *src = &inst->opr[0];
++  const Operand *dst = &inst->opr[1];
++  assert(src->type == REG);
++  enum RegSize size = src->reg.size;
++  int sno = opr_regno(&src->reg);
++  // A two byte (0x0f prefixed) opcode: the size selects the second byte.
++  unsigned char op1 = opcode2 >= 0 ? opcode : (size == REG8 ? opcode : (unsigned char)(opcode + 1));
++  unsigned char op2 = opcode2 >= 0 ? (size == REG8 ? opcode2 : (unsigned char)(opcode2 + 1)) : 0;
++  short buf[8];
++  int n = 0;
++  if (size == REG16)
++    buf[n++] = 0x66;
++
++  if (dst->type == REG) {
++    int dno = opr_regno(&dst->reg);
++    if (sno >= 8 || dno >= 8 || size == REG64)
++      buf[n++] = 0x40 | ((dno & 8) >> 3) | ((sno & 8) >> 1) | (size == REG64 ? 8 : 0);
++    buf[n++] = op1;
++    if (opcode2 >= 0)
++      buf[n++] = op2;
++    buf[n++] = 0xc0 | ((sno & 7) << 3) | (dno & 7);
++  } else if (dst->type == INDIRECT && dst->indirect.reg.no != RIP &&
++             (dst->indirect.offset.expr == NULL || dst->indirect.offset.expr->kind == EX_FIXNUM)) {
++    long offset = dst->indirect.offset.expr != NULL ? dst->indirect.offset.expr->fixnum : 0;
++    int bno = opr_regno(&dst->indirect.reg);
++    bool noofs = offset == 0 && (bno & 7) != RBP - RAX;
++    if (sno >= 8 || bno >= 8 || size == REG64)
++      buf[n++] = 0x40 | ((bno & 8) >> 3) | ((sno & 8) >> 1) | (size == REG64 ? 8 : 0);
++    buf[n++] = op1;
++    if (opcode2 >= 0)
++      buf[n++] = op2;
++    buf[n++] = (noofs ? 0x00 : is_im8(offset) ? 0x40 : 0x80) | (bno & 7) | ((sno & 7) << 3);
++    if ((bno & 7) == RSP - RAX)
++      buf[n++] = 0x24;
++
++    unsigned char *p = code->buf;
++    p = put_code_filtered(p, buf, n);
++    if (!noofs) {
++      if (is_im8(offset)) {
++        *p++ = IM8(offset);
++      } else if (is_im32(offset)) {
++        PUT_CODE(p, IM32(offset));
++        p += 4;
++      } else {
++        return NULL;
++      }
++    }
++    return p;
++  } else {
++    return NULL;
++  }
++
++  unsigned char *p = code->buf;
++  p = put_code_filtered(p, buf, n);
++  return p;
++}
++
++#define DEF_ASM_RM_R(name, opcode, opcode2) \
++  static unsigned char *name(Inst *inst, Code *code) { return asm_rm_r(inst, code, opcode, opcode2); }
++
++DEF_ASM_RM_R(asm_and_ir, 0x20, -1)
++DEF_ASM_RM_R(asm_or_ir, 0x08, -1)
++DEF_ASM_RM_R(asm_xor_ir, 0x30, -1)
++DEF_ASM_RM_R(asm_xchg_rr, 0x86, -1)
++DEF_ASM_RM_R(asm_xchg_ir, 0x86, -1)
++DEF_ASM_RM_R(asm_xadd_rr, 0x0f, 0xc0)
++DEF_ASM_RM_R(asm_xadd_ir, 0x0f, 0xc0)
++DEF_ASM_RM_R(asm_cmpxchg_rr, 0x0f, 0xb0)
++DEF_ASM_RM_R(asm_cmpxchg_ir, 0x0f, 0xb0)
++
++// "or $imm, r/m"
++static unsigned char *asm_or_imi(Inst *inst, Code *code) {
++  const Operand *dst = &inst->opr[1];
++  if (dst->type != INDIRECT || dst->indirect.reg.no == RIP ||
++      (dst->indirect.offset.expr != NULL && dst->indirect.offset.expr->kind != EX_FIXNUM))
++    return NULL;
++  long offset = dst->indirect.offset.expr != NULL ? dst->indirect.offset.expr->fixnum : 0;
++  long value = inst->opr[0].immediate;
++  // A size suffix ("orl"/"orq") picks the operand size; without one assume 32 bit.
++  enum RegSize size = inst->suffix_size != 0 ? inst->suffix_size - 1 : REG32;
++  if (size != REG32 && size != REG64)
++    return NULL;
++  int bno = opr_regno(&dst->indirect.reg);
++  bool noofs = offset == 0 && (bno & 7) != RBP - RAX;
++  short buf[] = {
++    (size == REG64 || bno >= 8) ? 0x40 | ((bno & 8) >> 3) | (size == REG64 ? 8 : 0) : -1,
++    is_im8(value) ? 0x83 : 0x81,
++    (noofs ? 0x00 : is_im8(offset) ? 0x40 : 0x80) | (bno & 7) | (1 << 3),
++    (bno & 7) == RSP - RAX ? 0x24 : -1,
++  };
++  unsigned char *p = code->buf;
++  p = put_code_filtered(p, buf, ARRAY_SIZE(buf));
++  if (!noofs) {
++    if (is_im8(offset)) {
++      *p++ = IM8(offset);
++    } else if (is_im32(offset)) {
++      PUT_CODE(p, IM32(offset));
++      p += 4;
++    } else {
++      return NULL;
++    }
++  }
++  if (is_im8(value)) {
++    *p++ = IM8(value);
++  } else if (is_im32(value)) {
++    PUT_CODE(p, IM32(value));
++    p += 4;
++  } else {
++    return NULL;
++  }
++  return p;
++}
++
++static unsigned char *asm_bsf(Inst *inst, Code *code) {
++  enum RegSize size = inst->opr[0].reg.size;
++  int sno = opr_regno(&inst->opr[0].reg);
++  int dno = opr_regno(&inst->opr[1].reg);
++  short buf[] = {
++    MAKE_REX0(size, dno, sno, 0x0f),
++    0xbc,
++    0xc0 | ((dno & 7) << 3) | (sno & 7),
++  };
++  unsigned char *p = code->buf;
++  p = put_code_filtered(p, buf, ARRAY_SIZE(buf));
++  return p;
++}
++
++static unsigned char *asm_hlt(Inst *inst, Code *code) {
++  UNUSED(inst);
++  MAKE_CODE(inst, code, 0xf4);
++  return code->buf;
++}
++
++static unsigned char *asm_pause(Inst *inst, Code *code) {
++  UNUSED(inst);
++  MAKE_CODE(inst, code, 0xf3, 0x90);
++  return code->buf;
++}
++
+ static unsigned char *asm_bsr(Inst *inst, Code *code) {
+   enum RegSize size = inst->opr[0].reg.size;
+   int sno = opr_regno(&inst->opr[0].reg);
+@@ -1664,6 +1822,14 @@ static const AsmInstFunc table[] = {
+   [CLTD] = asm_cltd,
+   [CQTO] = asm_cqto,
+   [BSR] = asm_bsr,
++  [BSF] = asm_bsf,
++  [HLT] = asm_hlt,
++  [PAUSE] = asm_pause,
++  [AND_IR] = asm_and_ir, [OR_IR] = asm_or_ir, [XOR_IR] = asm_xor_ir,
++  [OR_IMI] = asm_or_imi,
++  [XCHG_RR] = asm_xchg_rr, [XCHG_IR] = asm_xchg_ir,
++  [XADD_RR] = asm_xadd_rr, [XADD_IR] = asm_xadd_ir,
++  [CMPXCHG_RR] = asm_cmpxchg_rr, [CMPXCHG_IR] = asm_cmpxchg_ir,
+   [LZCNT] = asm_tzcnt,
+   [TZCNT] = asm_tzcnt,
+   [POPCNT] = asm_popcnt,
+@@ -1723,8 +1889,16 @@ void assemble_inst(Inst *inst, ParseInfo *parser, Code *code) {
+       unsigned char *p = (*func)(inst, code);
+       if (p != NULL) {
+         if (p > code->buf) {
++          int len = p - code->buf;
++          if (inst->prefix != 0) {
++            // Legacy prefixes (e.g. `lock') come before the opcode.
++            assert((size_t)len + 1 <= sizeof(code->buf));
++            memmove(code->buf + 1, code->buf, len);
++            code->buf[0] = inst->prefix;
++            ++len;
++          }
+           code->inst = inst;
+-          code->len = p - code->buf;
++          code->len = len;
+           assert((size_t)code->len <= sizeof(code->buf));
+         }
+         return;
+diff --git a/src/as/arch/x64/inst.h b/src/as/arch/x64/inst.h
+index 7ca7e32..887f4d0 100644
+--- a/src/as/arch/x64/inst.h
++++ b/src/as/arch/x64/inst.h
+@@ -51,6 +51,15 @@ enum Opcode {
+ 
+   INT, SYSCALL,
+ 
++  // Instructions that inline asm templates commonly use.
++  HLT, PAUSE,
++  BSF,
++  AND_IR, OR_IR, XOR_IR,
++  OR_IMI,
++  XCHG_RR, XCHG_IR,
++  XADD_RR, XADD_IR,
++  CMPXCHG_RR, CMPXCHG_IR,
++
+   MOVSD_XX, MOVSD_IX, MOVSD_XI,
+   ADDSD, SUBSD, MULSD, DIVSD, XORPD,
+   COMISD, UCOMISD,
+@@ -167,5 +176,7 @@ typedef struct Operand {
+ 
+ typedef struct Inst {
+   enum Opcode op;
++  int prefix;       // Legacy instruction prefix byte (e.g. 0xf0 for `lock'), or 0.
++  int suffix_size;  // Register size a size suffixed mnemonic ("orq") asked for; 0 if none.
+   Operand opr[2];  // src, dst
+ } Inst;
+diff --git a/src/as/arch/x64/parse_x64.c b/src/as/arch/x64/parse_x64.c
+index 6bea66c..00da763 100644
+--- a/src/as/arch/x64/parse_x64.c
++++ b/src/as/arch/x64/parse_x64.c
+@@ -30,7 +30,9 @@ enum RawOpcode {
+   R_CMP,
+   R_TEST,
+   R_CWTL, R_CLTD, R_CQTO,
+-  R_BSR, R_LZCNT, R_TZCNT, R_POPCNT,
++  R_BSR, R_BSF, R_LZCNT, R_TZCNT, R_POPCNT,
++  R_HLT, R_PAUSE,
++  R_XCHG, R_XADD, R_CMPXCHG,
+ 
+   R_SETO, R_SETNO, R_SETB, R_SETAE, R_SETE, R_SETNE, R_SETBE, R_SETA,
+   R_SETS, R_SETNS, R_SETP, R_SETNP, R_SETL, R_SETGE, R_SETLE, R_SETG,
+@@ -54,6 +56,8 @@ enum RawOpcode {
+   R_CVTSD2SS, R_CVTSS2SD,
+ 
+   R_ENDBR64,
++  // Aliases (must stay last: the raw opcode name table is indexed by these).
++  R_JZ, R_JNZ, R_JC, R_JNC, R_JNAE, R_JNB, R_JNA, R_JNBE, R_JPE, R_JPO, R_JNGE, R_JNG,
+ };
+ 
+ const char *kRawOpTable[] = {
+@@ -75,7 +79,9 @@ const char *kRawOpTable[] = {
+   "cmp",
+   "test",
+   "cwtl",  "cltd",  "cqto",
+-  "bsr", "lzcnt", "tzcnt", "popcnt",
++  "bsr", "bsf", "lzcnt", "tzcnt", "popcnt",
++  "hlt", "pause",
++  "xchg", "xadd", "cmpxchg",
+ 
+   "seto",  "setno",  "setb",  "setae",  "sete",  "setne",  "setbe",  "seta",
+   "sets",  "setns",  "setp",  "setnp",  "setl",  "setge",  "setle",  "setg",
+@@ -99,6 +105,10 @@ const char *kRawOpTable[] = {
+   "cvtsd2ss",  "cvtss2sd",
+ 
+   "endbr64",
++
++  // Condition-code aliases that use the same encodings (GCC-style spellings);
++  // they must stay at the end so the existing opcode indices are unchanged.
++  "jz",  "jnz",  "jc",  "jnc",  "jnae", "jnb", "jna", "jnbe", "jpe", "jpo", "jnge", "jng",
+   NULL,
+ };
+ 
+@@ -504,29 +514,37 @@ const ParseInstTable kParseInstTable[] = {
+     &(ParseOpArray){MOV_RD, {R8 | R16 | R32 | R64, EXP}},
+     &(ParseOpArray){MOV_SR, {SEG, R64}},
+   } },
+-  [R_MOVB] = { 4, (const ParseOpArray*[]){
++  [R_MOVB] = { 6, (const ParseOpArray*[]){
++    &(ParseOpArray){MOV_RR, {R8, R8}},
+     &(ParseOpArray){MOVB_IMI, {IMM, IND}},
+     &(ParseOpArray){MOVB_IMD, {IMM, EXP}},
+     &(ParseOpArray){MOV_IR, {IND, R8}},
+     &(ParseOpArray){MOV_RI, {R8, IND}},
++    &(ParseOpArray){MOV_IMR, {IMM, R8}},
+   } },
+-  [R_MOVW] = { 4, (const ParseOpArray*[]){
++  [R_MOVW] = { 6, (const ParseOpArray*[]){
++    &(ParseOpArray){MOV_RR, {R16, R16}},
+     &(ParseOpArray){MOVW_IMI, {IMM, IND}},
+     &(ParseOpArray){MOVW_IMD, {IMM, EXP}},
+     &(ParseOpArray){MOV_IR, {IND, R16}},
+     &(ParseOpArray){MOV_RI, {R16, IND}},
++    &(ParseOpArray){MOV_IMR, {IMM, R16}},
+   } },
+-  [R_MOVL] = { 4, (const ParseOpArray*[]){
++  [R_MOVL] = { 6, (const ParseOpArray*[]){
++    &(ParseOpArray){MOV_RR, {R32, R32}},
+     &(ParseOpArray){MOVL_IMI, {IMM, IND}},
+     &(ParseOpArray){MOVL_IMD, {IMM, EXP}},
+     &(ParseOpArray){MOV_IR, {IND, R32}},
+     &(ParseOpArray){MOV_RI, {R32, IND}},
++    &(ParseOpArray){MOV_IMR, {IMM, R32}},
+   } },
+-  [R_MOVQ] = { 4, (const ParseOpArray*[]){
++  [R_MOVQ] = { 6, (const ParseOpArray*[]){
++    &(ParseOpArray){MOV_RR, {R64, R64}},
+     &(ParseOpArray){MOVQ_IMI, {IMM, IND}},
+     &(ParseOpArray){MOVQ_IMD, {IMM, EXP}},
+     &(ParseOpArray){MOV_IR, {IND, R64}},
+     &(ParseOpArray){MOV_RI, {R64, IND}},
++    &(ParseOpArray){MOV_IMR, {IMM, R64}},
+   } },
+   [R_MOVSX] = { 6, (const ParseOpArray*[]){
+     &(ParseOpArray){MOVSX, {R8, R16}},
+@@ -555,7 +573,12 @@ const ParseInstTable kParseInstTable[] = {
+     &(ParseOpArray){ADD_IR, {IND, R8 | R16 | R32 | R64}},
+     &(ParseOpArray){ADD_IIR, {IIND, R8 | R16 | R32 | R64}},
+   } },
+-  [R_ADDQ] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){ADDQ, {IMM, IND}} } },
++  [R_ADDQ] = { 4, (const ParseOpArray*[]){
++    &(ParseOpArray){ADD_RR, {R64, R64}},
++    &(ParseOpArray){ADD_IMR, {IMM, R64}},
++    &(ParseOpArray){ADDQ, {IMM, IND}},
++    &(ParseOpArray){ADD_IR, {IND, R64}},
++  } },
+   [R_SUB] = { 8, (const ParseOpArray*[]){
+     &(ParseOpArray){SUB_RR, {R8, R8}},     &(ParseOpArray){SUB_RR, {R16, R16}},
+     &(ParseOpArray){SUB_RR, {R32, R32}},   &(ParseOpArray){SUB_RR, {R64, R64}},
+@@ -564,36 +587,53 @@ const ParseInstTable kParseInstTable[] = {
+     &(ParseOpArray){SUB_IIR, {IIND, R8 | R16 | R32 | R64}},
+     &(ParseOpArray){SUB_SRR, {SEG, R8 | R16 | R32 | R64}},
+   } },
+-  [R_SUBQ] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){SUBQ, {IMM, IND}} } },
++  [R_SUBQ] = { 4, (const ParseOpArray*[]){
++    &(ParseOpArray){SUB_RR, {R64, R64}},
++    &(ParseOpArray){SUB_IMR, {IMM, R64}},
++    &(ParseOpArray){SUBQ, {IMM, IND}},
++    &(ParseOpArray){SUB_IR, {IND, R64}},
++  } },
+   [R_MUL] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){MUL, {R8 | R16 | R32 | R64}} } },
+   [R_DIV] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){DIV, {R8 | R16 | R32 | R64}} } },
+   [R_IDIV] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){IDIV, {R8 | R16 | R32 | R64}} } },
+   [R_NEG] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){NEG, {R8 | R16 | R32 | R64}} } },
+   [R_NOT] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){NOT, {R8 | R16 | R32 | R64}} } },
+   [R_INC] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){INC, {R8 | R16 | R32 | R64}} } },
+-  [R_INCB] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){INCB, {IND}} } },
+-  [R_INCW] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){INCW, {IND}} } },
+-  [R_INCL] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){INCL, {IND}} } },
+-  [R_INCQ] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){INCQ, {IND}} } },
++  [R_INCB] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){INCB, {IND}},
++                                          &(ParseOpArray){INC, {R8 | R16 | R32 | R64}} } },
++  [R_INCW] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){INCW, {IND}},
++                                          &(ParseOpArray){INC, {R8 | R16 | R32 | R64}} } },
++  [R_INCL] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){INCL, {IND}},
++                                          &(ParseOpArray){INC, {R8 | R16 | R32 | R64}} } },
++  [R_INCQ] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){INCQ, {IND}},
++                                          &(ParseOpArray){INC, {R8 | R16 | R32 | R64}} } },
+   [R_DEC] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){DEC, {R8 | R16 | R32 | R64}} } },
+-  [R_DECB] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){DECB, {IND}} } },
+-  [R_DECW] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){DECW, {IND}} } },
+-  [R_DECL] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){DECL, {IND}} } },
+-  [R_DECQ] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){DECQ, {IND}} } },
+-  [R_AND] = { 5, (const ParseOpArray*[]){
++  [R_DECB] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){DECB, {IND}},
++                                          &(ParseOpArray){DEC, {R8 | R16 | R32 | R64}} } },
++  [R_DECW] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){DECW, {IND}},
++                                          &(ParseOpArray){DEC, {R8 | R16 | R32 | R64}} } },
++  [R_DECL] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){DECL, {IND}},
++                                          &(ParseOpArray){DEC, {R8 | R16 | R32 | R64}} } },
++  [R_DECQ] = { 2, (const ParseOpArray*[]){ &(ParseOpArray){DECQ, {IND}},
++                                          &(ParseOpArray){DEC, {R8 | R16 | R32 | R64}} } },
++  [R_AND] = { 6, (const ParseOpArray*[]){
+     &(ParseOpArray){AND_RR, {R8, R8}},     &(ParseOpArray){AND_RR, {R16, R16}},
+     &(ParseOpArray){AND_RR, {R32, R32}},   &(ParseOpArray){AND_RR, {R64, R64}},
+     &(ParseOpArray){AND_IMR, {IMM, R8 | R16 | R32 | R64}},
++    &(ParseOpArray){AND_IR, {R8 | R16 | R32 | R64, IND}},
+   } },
+-  [R_OR] = { 5, (const ParseOpArray*[]){
++  [R_OR] = { 7, (const ParseOpArray*[]){
+     &(ParseOpArray){OR_RR, {R8, R8}},     &(ParseOpArray){OR_RR, {R16, R16}},
+     &(ParseOpArray){OR_RR, {R32, R32}},   &(ParseOpArray){OR_RR, {R64, R64}},
+     &(ParseOpArray){OR_IMR, {IMM, R8 | R16 | R32 | R64}},
++    &(ParseOpArray){OR_IR, {R8 | R16 | R32 | R64, IND}},
++    &(ParseOpArray){OR_IMI, {IMM, IND}},
+   } },
+-  [R_XOR] = { 5, (const ParseOpArray*[]){
++  [R_XOR] = { 6, (const ParseOpArray*[]){
+     &(ParseOpArray){XOR_RR, {R8, R8}},     &(ParseOpArray){XOR_RR, {R16, R16}},
+     &(ParseOpArray){XOR_RR, {R32, R32}},   &(ParseOpArray){XOR_RR, {R64, R64}},
+     &(ParseOpArray){XOR_IMR, {IMM, R8 | R16 | R32 | R64}},
++    &(ParseOpArray){XOR_IR, {R8 | R16 | R32 | R64, IND}},
+   } },
+   [R_SHL] = { 2, (const ParseOpArray*[]){
+     &(ParseOpArray){SHL_RR, {R8CL, R8 | R16 | R32 | R64}},  // %cl, %reg
+@@ -623,6 +663,29 @@ const ParseInstTable kParseInstTable[] = {
+     &(ParseOpArray){BSR, {R16, R16}},   &(ParseOpArray){BSR, {R32, R32}},
+     &(ParseOpArray){BSR, {R64, R64}},
+   } },
++  [R_BSF] = { 3, (const ParseOpArray*[]){
++    &(ParseOpArray){BSF, {R16, R16}},   &(ParseOpArray){BSF, {R32, R32}},
++    &(ParseOpArray){BSF, {R64, R64}},
++  } },
++  [R_HLT] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){HLT} } },
++  [R_PAUSE] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){PAUSE} } },
++  [R_XCHG] = { 8, (const ParseOpArray*[]){
++    &(ParseOpArray){XCHG_RR, {R8, R8}},     &(ParseOpArray){XCHG_RR, {R16, R16}},
++    &(ParseOpArray){XCHG_RR, {R32, R32}},   &(ParseOpArray){XCHG_RR, {R64, R64}},
++    &(ParseOpArray){XCHG_IR, {R8, IND}},    &(ParseOpArray){XCHG_IR, {R16, IND}},
++    &(ParseOpArray){XCHG_IR, {R32, IND}},   &(ParseOpArray){XCHG_IR, {R64, IND}},
++  } },
++  [R_XADD] = { 6, (const ParseOpArray*[]){
++    &(ParseOpArray){XADD_RR, {R8, R8}},     &(ParseOpArray){XADD_RR, {R16, R16}},
++    &(ParseOpArray){XADD_RR, {R32, R32}},   &(ParseOpArray){XADD_RR, {R64, R64}},
++    &(ParseOpArray){XADD_IR, {R32, IND}},   &(ParseOpArray){XADD_IR, {R64, IND}},
++  } },
++  [R_CMPXCHG] = { 8, (const ParseOpArray*[]){
++    &(ParseOpArray){CMPXCHG_RR, {R8, R8}},     &(ParseOpArray){CMPXCHG_RR, {R16, R16}},
++    &(ParseOpArray){CMPXCHG_RR, {R32, R32}},   &(ParseOpArray){CMPXCHG_RR, {R64, R64}},
++    &(ParseOpArray){CMPXCHG_IR, {R8, IND}},    &(ParseOpArray){CMPXCHG_IR, {R16, IND}},
++    &(ParseOpArray){CMPXCHG_IR, {R32, IND}},   &(ParseOpArray){CMPXCHG_IR, {R64, IND}},
++  } },
+   [R_LZCNT] = { 3, (const ParseOpArray*[]){
+     &(ParseOpArray){LZCNT, {R16, R16}},   &(ParseOpArray){LZCNT, {R32, R32}},
+     &(ParseOpArray){LZCNT, {R64, R64}},
+@@ -719,4 +782,17 @@ const ParseInstTable kParseInstTable[] = {
+   [R_SQRTSD] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){SQRTSD, {XMM, XMM}}, } },
+ 
+   [R_ENDBR64] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){ENDBR64}, } },
++  // Condition-code aliases: same encodings as their canonical spelling.
++  [R_JZ]   = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JE,   {EXP}} } },
++  [R_JNZ]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JNE,  {EXP}} } },
++  [R_JC]   = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JB,   {EXP}} } },
++  [R_JNC]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JAE,  {EXP}} } },
++  [R_JNAE] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JB,   {EXP}} } },
++  [R_JNB]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JAE,  {EXP}} } },
++  [R_JNA]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JBE,  {EXP}} } },
++  [R_JNBE] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JA,   {EXP}} } },
++  [R_JPE]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JP,   {EXP}} } },
++  [R_JPO]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JNP,  {EXP}} } },
++  [R_JNGE] = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JL,   {EXP}} } },
++  [R_JNG]  = { 1, (const ParseOpArray*[]){ &(ParseOpArray){JLE,  {EXP}} } },
+ };
+diff --git a/src/as/as.c b/src/as/as.c
+index 6bfedae..3c1664d 100644
+--- a/src/as/as.c
++++ b/src/as/as.c
+@@ -11,7 +11,9 @@
+ #include "table.h"
+ #include "util.h"
+ 
+-#define PROG_START      (0x100)
++// Must match the linker's PROG_START (src/ld/ld.c): the ELF header plus the
++// program header table occupy [0, PROG_START).
++#define PROG_START      (0x1000)
+ #define START_ADDRESS   (0x01000000 + PROG_START)
+ #define LOAD_ADDRESS    START_ADDRESS
+ 
+@@ -75,34 +77,45 @@ static void parse_file(FILE *fp, ParseInfo *parser) {
+   parser->lineno = 0;
+   parser->rawline = parser->p = NULL;
+   parser->prefetched = NULL;
++  parser->suffix_size = 0;
++  parser->pending_prefix = 0;
+   set_current_section(parser, kSecText, kSegText, SF_EXECUTABLE);
+ 
+   for (;;) {
+     if (!read_line_comment_skip(fp, parser))
+       break;
+ 
+-    SectionInfo *section = parser->current_section;
+-    Vector *irs = section->irs;
+-    Line line;
+-    if (!parse_line(&line, parser))
+-      continue;
++    // One line may hold several statements separated by `;'.
++    for (;;) {
++      SectionInfo *section = parser->current_section;
++      Vector *irs = section->irs;
++      Line line;
++      if (!parse_line(&line, parser))
++        break;
+ 
+-    if (line.label != NULL) {
+-      vec_push(irs, new_ir_label(line.label));
++      if (line.label != NULL) {
++        vec_push(irs, new_ir_label(line.label));
+ 
+-      if (!add_label_table(parser->label_table, line.label, section, true, false))
+-        ++parser->error_count;
+-    }
++        if (!add_label_table(parser->label_table, line.label, section, true, false))
++          ++parser->error_count;
++      }
+ 
+-    if (line.dir != NODIRECTIVE)
+-      continue;
++      if (line.dir != NODIRECTIVE)
++        break;
++
++      if (line.inst != NULL) {
++        Code code;
++        assemble_inst(line.inst, parser, &code);
++        if (code.len > 0)
++          vec_push(irs, new_ir_code(&code));
++      }
+ 
+-    if (line.inst != NULL) {
+-      Code code;
+-      assemble_inst(line.inst, parser, &code);
+-      if (code.len > 0)
+-        vec_push(irs, new_ir_code(&code));
++      const char *p = skip_whitespaces(parser->p);
++      if (*p != ';')
++        break;
++      parser->p = p + 1;  // Next statement follows on the same line.
+     }
++    parser->pending_prefix = 0;  // A prefix must prefix an instruction on this line.
+   }
+ 
+   // Ensure alias label exists.
+diff --git a/src/as/emit_elf.c b/src/as/emit_elf.c
+index 6d64917..1afac71 100644
+--- a/src/as/emit_elf.c
++++ b/src/as/emit_elf.c
+@@ -78,6 +78,13 @@ static int construct_symtab(Symtab *symtab, Vector *sections, Table *label_table
+     case LK_OBJECT:  type = STT_OBJECT; break;
+     }
+     sym->st_info = ELF64_ST_INFO(bind, type);
++    if (label->flag & LF_HIDDEN) {
++#ifndef STV_HIDDEN
++      // xcc's own elf.h doesn't define the visibility values yet.
++#define STV_HIDDEN  2
++#endif
++      sym->st_other = STV_HIDDEN;
++    }
+     sym->st_value = (target->flag & LF_DEFINED) ? target->address - target->section->start_address : 0;
+     sym->st_size = target->size;
+     assert(target->section == NULL || target->section->index > 0);
+diff --git a/src/as/parse_asm.c b/src/as/parse_asm.c
+index 007ecfb..623250c 100644
+--- a/src/as/parse_asm.c
++++ b/src/as/parse_asm.c
+@@ -70,6 +70,8 @@ static const char *kDirectiveTable[] = {
+   WEAK,
+   "extern",
+   "set",
++  "global",
++  "hidden",
+ #ifndef __NO_FLONUM
+   "float",
+   "double",
+@@ -588,9 +590,21 @@ static const Name *alloc_dummy_label(void) {
+ }
+ #endif
+ 
++// Map a size suffix character ("b", "w", "l", "q") to a register size, or -1.
++static int suffix_reg_size(char c) {
++  switch (tolower(c)) {
++  case 'b': return REG8;
++  case 'w': return REG16;
++  case 'l': return REG32;
++  case 'q': return REG64;
++  default: return -1;
++  }
++}
++
+ static /*enum RawOpcode*/int find_raw_opcode(ParseInfo *parser) {
+   const char *p = parser->p;
+   const char *start = p;
++  parser->suffix_size = 0;
+ 
+   while (isalnum(*p) || *p == '.')
+     ++p;
+@@ -606,16 +620,61 @@ static /*enum RawOpcode*/int find_raw_opcode(ParseInfo *parser) {
+         return i + 1;
+       }
+     }
++
++    // Size suffixed mnemonic ("addq", "movl", ...): assemble it like the base
++    // mnemonic, but remember the size the suffix demands.
++    if (n > 1) {
++      int size = suffix_reg_size(start[n - 1]);
++      if (size >= 0) {
++        for (int i = 0; ; ++i) {
++          const char *name = kRawOpTable[i];
++          if (name == NULL)
++            break;
++          size_t len = strlen(name);
++          if (n - 1 == len && strncasecmp(start, name, n - 1) == 0) {
++            parser->p = skip_whitespaces(p);
++            parser->suffix_size = size + 1;
++            return i + 1;
++          }
++        }
++      }
++    }
+   }
+   return R_NOOP;
+ }
+ 
++// `lock' and friends prefix the instruction that follows.
++static bool consume_inst_prefix(ParseInfo *parser, int *pprefix) {
++  const char *p = parser->p;
++  static const struct {
++    const char *name;
++    int prefix;
++  } kPrefixes[] = {
++    {"lock", 0xf0},
++  };
++  for (size_t i = 0; i < ARRAY_SIZE(kPrefixes); ++i) {
++    size_t len = strlen(kPrefixes[i].name);
++    if (strncasecmp(p, kPrefixes[i].name, len) == 0 && !is_label_chr(p[len])) {
++      parser->p = skip_whitespaces(p + len);
++      *pprefix = kPrefixes[i].prefix;
++      return true;
++    }
++  }
++  return false;
++}
++
+ static bool parse_inst(ParseInfo *parser, Line *line) {
+   Inst inst;
+   inst.op = NOOP;
++  inst.prefix = 0;
++  inst.suffix_size = 0;
+   for (int i = 0; i < (int)ARRAY_SIZE(inst.opr); ++i)
+     inst.opr[i].type = NOOPERAND;
+ 
++  inst.prefix = parser->pending_prefix;
++  parser->pending_prefix = 0;
++  consume_inst_prefix(parser, &inst.prefix);
++
+   /*enum RawOpcode*/int op = find_raw_opcode(parser);
+   if (op != R_NOOP) {
+     const ParseInstTable *pt = &kParseInstTable[op];
+@@ -665,6 +724,16 @@ static bool parse_inst(ParseInfo *parser, Line *line) {
+ 
+     if (n > 0) {
+       inst.op = candidates[0]->op;
++      inst.suffix_size = parser->suffix_size;
++      if (inst.suffix_size != 0) {
++        // Check the operands match the size a suffixed mnemonic asked for.
++        for (int i = 0; i < (int)ARRAY_SIZE(inst.opr); ++i) {
++          if (inst.opr[i].type == REG && inst.opr[i].reg.size != inst.suffix_size - 1) {
++            parse_error(parser, "illegal operand");
++            return false;
++          }
++        }
++      }
+ 
+ #if XCC_TARGET_ARCH == XCC_ARCH_RISCV64
+       // Tweak for instruction.
+@@ -695,6 +764,9 @@ static bool parse_inst(ParseInfo *parser, Line *line) {
+     Inst *cloned = calloc_or_die(sizeof(inst));
+     *cloned = inst;
+     line->inst = cloned;
++  } else if (inst.prefix != 0) {
++    // A lone prefix ("lock ; cmpxchg ...") applies to the next instruction.
++    parser->pending_prefix = inst.prefix;
+   }
+   return true;
+ }
+@@ -922,13 +994,17 @@ static bool dir_type(ParseInfo *parser, enum DirectiveType dir) {
+   if (*parser->p != ',')
+     return parse_error(parser, ".type: `,' expected");
+   parser->p = skip_whitespaces(parser->p + 1);
++  // GAS accepts both the "@" and the "%" prefix ("%function" survives the C
++  // preprocessor, and musl's crt_arch.h uses it).
++  if (*parser->p == '@' || *parser->p == '%')
++    ++parser->p;
+   enum LabelKind kind = LK_NONE;
+-  if (strcmp(parser->p, "@function") == 0) {
++  if (strncmp(parser->p, "function", 8) == 0 && !is_label_chr(parser->p[8])) {
+     kind = LK_FUNC;
+-    parser->p += 9;
+-  } else if (strcmp(parser->p, "@object") == 0) {
++    parser->p += 8;
++  } else if (strncmp(parser->p, "object", 6) == 0 && !is_label_chr(parser->p[6])) {
+     kind = LK_OBJECT;
+-    parser->p += 7;
++    parser->p += 6;
+   } else {
+     return parse_error(parser, "illegal .type");
+   }
+@@ -1005,17 +1081,22 @@ static bool dir_label_attrib(ParseInfo *parser, enum DirectiveType dir) {
+   const Name *name = parse_label(parser);
+   if (name == NULL) {
+     char buf[32];
+-    snprintf(buf, sizeof(buf), "%s: label expected", dir == DT_GLOBL ? ".globl" : ".local");
++    const char *dirname = dir == DT_GLOBL ? ".globl" : dir == DT_GLOBAL ? ".global"
++                         : dir == DT_HIDDEN ? ".hidden" : ".local";
++    snprintf(buf, sizeof(buf), "%s: label expected", dirname);
+     return parse_error(parser, buf);
+   }
+ 
+   SectionInfo *section = parser->current_section;
+-  LabelInfo *label = add_label_table(parser->label_table, name, section, false, dir == DT_GLOBL);
++  bool global = dir == DT_GLOBL || dir == DT_GLOBAL;
++  LabelInfo *label = add_label_table(parser->label_table, name, section, false, global);
+   if (label == NULL) {
+     ++parser->error_count;
+   } else {
+     if (dir == DT_WEAK)
+       label->flag |= LF_WEAK;
++    else if (dir == DT_HIDDEN)
++      label->flag |= LF_HIDDEN;
+   }
+   return true;
+ }
+@@ -1111,6 +1192,7 @@ static inline bool handle_directive(ParseInfo *parser, enum DirectiveType dir) {
+     [DT_COMM] = dir_comm,
+     [DT_ZERO] = dir_zero,
+     [DT_GLOBL] = dir_label_attrib, [DT_LOCAL] = dir_label_attrib, [DT_WEAK] = dir_label_attrib,
++    [DT_GLOBAL] = dir_label_attrib, [DT_HIDDEN] = dir_label_attrib,
+     [DT_EXTERN] = NULL,
+     [DT_SET] = dir_set,
+   #ifndef __NO_FLONUM
+@@ -1189,6 +1271,11 @@ bool parse_line(Line *line, ParseInfo *parser) {
+     parser->p = p;
+     if (!parse_inst(parser, line))
+       return false;
++    if (line->inst == NULL && line->label == NULL && parser->pending_prefix == 0) {
++      parse_error(parser, "unknown instruction");
++      parser->p = NULL;
++      return false;
++    }
+   }
+   return true;
+ }
+diff --git a/src/as/parse_asm.h b/src/as/parse_asm.h
+index 7b5d938..216c221 100644
+--- a/src/as/parse_asm.h
++++ b/src/as/parse_asm.h
+@@ -36,6 +36,8 @@ enum DirectiveType {
+   DT_WEAK,
+   DT_EXTERN,
+   DT_SET,
++  DT_GLOBAL,  // Alias of ".globl".
++  DT_HIDDEN,  // Symbol visibility: hidden.
+ #ifndef __NO_FLONUM
+   DT_FLOAT,
+   DT_DOUBLE,
+@@ -77,6 +79,8 @@ typedef struct ParseInfo {
+   int error_count;
+ 
+   const Token *prefetched;
++  int suffix_size;  // Register size demanded by a size suffixed mnemonic ("movq"), 0 if none.
++  int pending_prefix;  // Instruction prefix seen before a `;' separator (e.g. "lock ; cmpxchg").
+ 
+   Table *section_infos;  // <SectionInfo*>
+   Table *label_table;  // <LabelInfo*>
+@@ -185,6 +189,7 @@ bool is_label_chr(char c);
+ #define LF_REFERRED  (1 << 2)
+ #define LF_COMM      (1 << 3)
+ #define LF_WEAK      (1 << 4)
++#define LF_HIDDEN    (1 << 5)
+ 
+ enum LabelKind {
+   LK_NONE,
+diff --git a/src/cc/arch/x64/asm_constraint.c b/src/cc/arch/x64/asm_constraint.c
+new file mode 100644
+index 0000000..0fcd8ad
+--- /dev/null
++++ b/src/cc/arch/x64/asm_constraint.c
+@@ -0,0 +1,115 @@
++// Inline asm constraint handling (x86-64)
++
++#include "../../../config.h"
++
++#include <stdbool.h>
++#include <stddef.h>
++
++#include "asm_operand.h"
++#include "ir.h"
++
++// Physical register numbers as laid out in kRegSizeTable of ir_x64.c:
++//
++//   index: 0    1    2    3    4    5    6    7    8     9     10    11    12    13    14
++//   reg  : rax  rdi  rsi  rdx  rcx  r8   r9   rbx  r12   r13   r14   r15   rbp   r10   r11
++//
++// (7 temporary, 6 callee save, 2 caller save -- see kCalleeSaveRegs/kCallerSaveRegs.)
++enum {
++  ASM_REG_RAX = 0,  ASM_REG_RDI = 1,  ASM_REG_RSI = 2,  ASM_REG_RDX = 3,
++  ASM_REG_RCX = 4,  ASM_REG_R8  = 5,  ASM_REG_R9  = 6,  ASM_REG_RBX = 7,
++  ASM_REG_R12 = 8,  ASM_REG_R13 = 9,  ASM_REG_R14 = 10, ASM_REG_R15 = 11,
++  ASM_REG_RBP = 12, ASM_REG_R10 = 13, ASM_REG_R11 = 14,
++};
++
++// Parse an output/input constraint and report the operand kind.
++//
++//   `*preg`       receives the required physical register number, or -1 when the
++//                 operand may live in any general purpose register.  For a tied
++//                 operand ("0", "1", ...) it receives the operand index instead.
++//   `*preadwrite` is set to true for a read-write output ("+r").
++enum AsmOperandKind parse_asm_constraint(const char *constraint, int *preg, bool *preadwrite) {
++  *preg = -1;
++  *preadwrite = false;
++  for (const char *p = constraint; *p != '\0'; ++p) {
++    char c = *p;
++    if (c == '=' || c == '&' || c == '%' || c == '?' || c == '!')
++      continue;  // Output (or early clobber) modifier.
++    if (c == '+') {
++      *preadwrite = true;
++      continue;
++    }
++    if (c == ',')
++      return AOK_UNSUPPORTED;  // Multiple alternatives: not supported (yet).
++
++    if (c == 'm' || c == 'o' || c == 'V' || c == 'Q') {
++      // Memory operand.  xcc keeps the address in a register, and the template
++      // substitution renders it as "(<reg>)".
++      return AOK_MEM;
++    }
++    if (c == 'i' || c == 'n' || c == 's' || c == 'I' || c == 'J' || c == 'K' ||
++        c == 'L' || c == 'M' || c == 'N' || c == 'O' || c == 'P') {
++      // Immediate operand (integer constant).
++      return AOK_IMM;
++    }
++    if (c >= '0' && c <= '9') {
++      *preg = c - '0';  // Matching constraint: same location as operand N.
++      return AOK_TIED;
++    }
++    switch (c) {
++    case 'a': *preg = ASM_REG_RAX; return AOK_REG;
++    case 'b': *preg = ASM_REG_RBX; return AOK_REG;
++    case 'c': *preg = ASM_REG_RCX; return AOK_REG;
++    case 'd': *preg = ASM_REG_RDX; return AOK_REG;
++    case 'S': *preg = ASM_REG_RSI; return AOK_REG;
++    case 'D': *preg = ASM_REG_RDI; return AOK_REG;
++    case 'r':    // Any general purpose register.
++    case 'R':    // Legacy ("any register"): treat like 'r'.
++    case 'q':    // Any register addressable as 8/16/32/64 bit.
++    case 'X':    // Any operand whatsoever.
++    case 'g':    // Register, memory or immediate: use a register.
++    case 'p':    // Address operand.
++      return AOK_REG;
++    default:
++      // x87/SSE/AVX register classes ('f', 't', 'u', 'x', 'w', 'y', 'v', ...) and
++      // anything else xcc has no register operand for.
++      return AOK_UNSUPPORTED;
++    }
++  }
++  return AOK_REG;  // Empty constraint (GCC uses "" for operands the asm ignores).
++}
++
++static bool name_is(const char *name, const char *str) {
++  for (;;) {
++    if (*name != *str)
++      return false;
++    if (*name == '\0')
++      return true;
++    ++name, ++str;
++  }
++}
++
++// Parse a clobber list entry or a register variable's asm name ("rcx", "r11",
++// ...).  Returns the physical register number, or -1 when the name is not a
++// general purpose register xcc can reserve (e.g. "memory", "cc", "st").
++int parse_asm_clobber(const char *clobber) {
++  static const struct {
++    const char *name;
++    int reg;
++  } kClobbers[] = {
++    {"rax", ASM_REG_RAX}, {"eax", ASM_REG_RAX}, {"ax", ASM_REG_RAX}, {"al", ASM_REG_RAX},
++    {"rbx", ASM_REG_RBX}, {"ebx", ASM_REG_RBX}, {"bx", ASM_REG_RBX}, {"bl", ASM_REG_RBX},
++    {"rcx", ASM_REG_RCX}, {"ecx", ASM_REG_RCX}, {"cx", ASM_REG_RCX}, {"cl", ASM_REG_RCX},
++    {"rdx", ASM_REG_RDX}, {"edx", ASM_REG_RDX}, {"dx", ASM_REG_RDX}, {"dl", ASM_REG_RDX},
++    {"rsi", ASM_REG_RSI}, {"esi", ASM_REG_RSI}, {"si", ASM_REG_RSI}, {"sil", ASM_REG_RSI},
++    {"rdi", ASM_REG_RDI}, {"edi", ASM_REG_RDI}, {"di", ASM_REG_RDI}, {"dil", ASM_REG_RDI},
++    {"r8", ASM_REG_R8}, {"r8d", ASM_REG_R8}, {"r9", ASM_REG_R9}, {"r9d", ASM_REG_R9},
++    {"r10", ASM_REG_R10}, {"r10d", ASM_REG_R10}, {"r11", ASM_REG_R11}, {"r11d", ASM_REG_R11},
++    {"r12", ASM_REG_R12}, {"r13", ASM_REG_R13}, {"r14", ASM_REG_R14}, {"r15", ASM_REG_R15},
++    {"rbp", ASM_REG_RBP}, {"ebp", ASM_REG_RBP},
++  };
++  for (size_t i = 0; i < sizeof(kClobbers) / sizeof(kClobbers[0]); ++i) {
++    if (name_is(kClobbers[i].name, clobber))
++      return kClobbers[i].reg;
++  }
++  return -1;
++}
+diff --git a/src/cc/arch/x64/ir_x64.c b/src/cc/arch/x64/ir_x64.c
+index 8e6a99e..de0b891 100644
+--- a/src/cc/arch/x64/ir_x64.c
++++ b/src/cc/arch/x64/ir_x64.c
+@@ -6,6 +6,7 @@
+ #include <string.h>
+ 
+ #include "ast.h"
++#include "asm_operand.h"
+ #include "be_aux.h"
+ #include "regalloc.h"
+ #include "table.h"
+@@ -85,8 +86,27 @@ static unsigned long detect_extra_occupied(RegAlloc *ra, IR *ir) {
+   return ioccupy;
+ }
+ 
++static unsigned long detect_asm_occupied(IR *ir) {
++  // Keep the registers listed in an inline asm clobber list free while the
++  // statement executes, so that live values are not silently destroyed.
++  if (ir->kind != IR_ASM)
++    return 0;
++  Vector *clobbers = ir->asm_.clobbers;
++  if (clobbers == NULL)
++    return 0;
++  unsigned long ioccupy = 0;
++  for (int i = 0; i < clobbers->len; ++i) {
++    const char *clobber = clobbers->data[i];
++    int reg = parse_asm_clobber(clobber);
++    if (reg >= 0)
++      ioccupy |= 1UL << reg;
++  }
++  return ioccupy;
++}
++
+ const RegAllocSettings kArchRegAllocSettings = {
+   .detect_extra_occupied = detect_extra_occupied,
++  .detect_asm_occupied = detect_asm_occupied,
+   .reg_param_mapping = ArchRegParamMapping,
+   .reg_return_mapping = ArchRegReturnMapping,
+   {
+diff --git a/src/cc/backend/asm_operand.h b/src/cc/backend/asm_operand.h
+new file mode 100644
+index 0000000..6555d9c
+--- /dev/null
++++ b/src/cc/backend/asm_operand.h
+@@ -0,0 +1,23 @@
++// Inline asm operand constraints.
++//
++// The architecture specific implementation (e.g. src/cc/arch/x64/asm_constraint.c)
++// provides these; the generic backend uses them to bind asm operands to the
++// registers/bits that the constraint string asks for.
++
++#pragma once
++
++#include <stdbool.h>
++
++#include "ir.h"  // enum AsmOperandKind
++
++// Parse an output/input constraint such as "=a", "r", "m", "0".
++// `*preg` receives the required physical register number, or -1 when the
++// operand may live in any general purpose register.  For a matching constraint
++// ("0", "1", ...) it receives the index of the operand this one is tied to.
++// `*preadwrite` reports whether the constraint is a read-write output ("+").
++enum AsmOperandKind parse_asm_constraint(const char *constraint, int *preg, bool *preadwrite);
++
++// Parse one clobber list entry (or a register variable's asm name).  Returns the
++// physical register number that has to stay free, or -1 when the entry is not a
++// general purpose register (e.g. "memory", "cc").
++int parse_asm_clobber(const char *clobber);
+diff --git a/src/cc/backend/codegen.c b/src/cc/backend/codegen.c
+index 345e846..756d4f8 100644
+--- a/src/cc/backend/codegen.c
++++ b/src/cc/backend/codegen.c
+@@ -8,6 +8,7 @@
+ #include <string.h>
+ 
+ #include "ast.h"
++#include "asm_operand.h"
+ #include "be_aux.h"
+ #include "cc_misc.h"  // is_function_omitted
+ #include "fe_misc.h"  // curfunc, curscope
+@@ -112,6 +113,16 @@ static void alloc_variable_registers(Function *func) {
+         vreg->flag |= VRF_REF;
+       if (type->qualifier & TQ_VOLATILE)
+         vreg->flag |= (storage & VS_REGISTER) ? (VRF_VOLATILEREG | VRF_NO_SPILL) : VRF_VOLATILE;
++      if (varinfo->asm_reg != NULL) {
++        // GNU register variable: `register long r10 __asm__("r10") = x;` has to
++        // live in that physical register.  musl's __syscall4/5/6 rely on it to
++        // put the 4th syscall argument in %r10.
++        int reg = parse_asm_clobber(varinfo->asm_reg);
++        if (reg >= 0) {
++          vreg->flag |= VRF_FIXED_REG;
++          vreg->fixed_reg_index = reg;
++        }
++      }
+       varinfo->local.vreg = vreg;
+       varinfo->local.frameinfo = &vreg->frame;
+     }
+@@ -327,24 +338,250 @@ static void gen_clear(const Type *type, VReg *dst) {
+   }
+ }
+ 
+-static inline void gen_asm(Stmt *stmt) {
+-  VReg *output = NULL;
+-  Vector *registers = new_vector();
+-  if (stmt->asm_.outputs != NULL) {
+-    assert(stmt->asm_.outputs->len == 1);  // TODO: Handle multiple outputs.
+-    const AsmArg *arg = stmt->asm_.outputs->data[0];
+-    assert(arg->expr->kind == EX_VAR);
+-    output = gen_expr(arg->expr);
++// Add a temporary virtual register for an inline asm operand.  `reg` >= 0 pins
++// the value to that physical register, which is what a fixed register
++// constraint ("a", "D", "S", ...) asks for; `reg` < 0 lets the register
++// allocator pick any general purpose register.
++static VReg *new_asm_operand_vreg(const Type *type, int reg) {
++  if (reg >= 0 && (to_vflag(type) & VRF_FLONUM))
++    error("inline asm: floating point register operands are not supported");
++  VReg *vreg = add_new_vreg(type);
++  // The operand value has to be in place when the asm template runs, so the
++  // optimiser must not coalesce or move it around (still kept in a register).
++  vreg->flag |= VRF_VOLATILEREG;
++  if (reg >= 0) {
++    vreg->flag |= VRF_FIXED_REG;
++    vreg->fixed_reg_index = reg;
++  }
++  return vreg;
++}
++
++// Whether the asm template refers to operand `index` ("%<index>").
++static bool asm_template_names(const Vector *templates, int index) {
++  for (int i = 1; i < templates->len; i += 2) {
++    if ((uintptr_t)templates->data[i] == (uintptr_t)index)
++      return true;
+   }
+-  if (stmt->asm_.inputs != NULL) {
+-    for (int i = 0; i < stmt->asm_.inputs->len; ++i) {
+-      const AsmArg *arg = stmt->asm_.inputs->data[i];
+-      VReg *vreg = gen_expr(arg->expr);
+-      vec_push(registers, vreg);
++  return false;
++}
++
++// One parsed operand constraint.
++typedef struct {
++  enum AsmOperandKind kind;
++  int reg;         // Physical register, or the operand index for AOK_TIED.
++  bool readwrite;  // Output constraint starts with '+'.
++} AsmConstraint;
++
++static AsmConstraint get_asm_constraint(const AsmArg *arg) {
++  AsmConstraint c;
++  c.kind = parse_asm_constraint(arg->constraint->str.buf, &c.reg, &c.readwrite);
++  if (c.kind == AOK_UNSUPPORTED)
++    error("inline asm: unsupported constraint \"%s\"", arg->constraint->str.buf);
++  return c;
++}
++
++// Assign an inline asm result to the lvalue its output operand names.
++static void gen_asm_output_store(Expr *expr, VReg *value) {
++  if (expr->kind == EX_VAR) {
++    Scope *scope;
++    const VarInfo *varinfo = scope_find(expr->var.scope, expr->var.name, &scope);
++    if (varinfo != NULL && scope == expr->var.scope && !is_global_scope(scope) &&
++        is_local_storage(varinfo) && varinfo->local.vreg != NULL) {
++      // Plain local variable: assign it directly instead of going through its
++      // address (which would force it onto the stack).
++      new_ir_mov(varinfo->local.vreg, value);
++      return;
++    }
++  }
++  new_ir_store(gen_lval_addr(expr), 0, value);
++}
++
++// Inline assembly with operands.
++//
++// xcc's IR carries one destination register plus a list of additional operand
++// registers; the template refers to them as `%0', `%1', ... (outputs first,
++// then inputs, matching the operand numbering of the source).  This function
++// turns the parsed constraints into that representation:
++//
++//   * a register output ("=a", "=r", ...) becomes a temporary that the asm
++//     writes into; its value is assigned to the user variable afterwards,
++//   * a memory output ("=m") becomes a temporary holding the address, which the
++//     template substitution renders as "(<reg>)",
++//   * a register input is loaded into a temporary pinned to the register the
++//     constraint names, and shares an output's register when tied with "0",
++//     "1", ...; a plain "r" input uses the value where it already is,
++//   * an immediate input ("i", "n") is substituted as "$value",
++//   * a read-write output ("+r") is initialised with the current value,
++//   * clobbers are passed on so that the register allocator keeps those
++//     registers free while the statement executes.
++static void gen_asm(Stmt *stmt) {
++  const Asm *asm_ = &stmt->asm_;
++  int noutputs = asm_->outputs != NULL ? asm_->outputs->len : 0;
++  int ninputs = asm_->inputs != NULL ? asm_->inputs->len : 0;
++  int noperands = noutputs + ninputs;
++
++  Vector *operands = new_vector();  // <AsmOperand*>, template index order
++  VReg **slots = noperands > 0 ? ALLOCA(sizeof(VReg*) * noperands) : NULL;
++  enum AsmOperandKind *slot_kind =
++      noperands > 0 ? ALLOCA(sizeof(enum AsmOperandKind) * noperands) : NULL;
++  int *out_reg = noutputs > 0 ? ALLOCA(sizeof(int) * noutputs) : NULL;
++
++  // Outputs.
++  for (int i = 0; i < noutputs; ++i) {
++    const AsmArg *arg = asm_->outputs->data[i];
++    AsmConstraint c = get_asm_constraint(arg);
++    if (arg->expr == NULL)
++      error("inline asm: output operand \"%s\" requires an lvalue", arg->constraint->str.buf);
++    if (c.kind == AOK_IMM || c.kind == AOK_TIED)
++      error("inline asm: invalid output constraint \"%s\"", arg->constraint->str.buf);
++    if (c.kind == AOK_REG && (to_vflag(arg->expr->type) & VRF_FLONUM))
++      error("inline asm: floating point output operands are not supported (use \"=m\")");
++
++    AsmOperand *operand = calloc_or_die(sizeof(*operand));
++    operand->kind = c.kind;
++    vec_push(operands, operand);
++    slot_kind[i] = c.kind;
++    out_reg[i] = c.reg;
++
++    if (c.kind == AOK_MEM) {
++      // The operand is the address of the memory the asm reads/writes.
++      VReg *addr = new_asm_operand_vreg(&tyVoidPtr, -1);
++      new_ir_mov(addr, gen_lval_addr(arg->expr));
++      slots[i] = addr;
++    } else {
++      // The asm writes its result into this temporary.
++      VReg *tmp = new_asm_operand_vreg(arg->expr->type, c.reg);
++      if (c.readwrite)  // "+r": the current value is an input as well.
++        new_ir_mov(tmp, gen_expr(arg->expr));
++      slots[i] = tmp;
++    }
++  }
++
++  // Inputs.
++  for (int i = 0; i < ninputs; ++i) {
++    const AsmArg *arg = asm_->inputs->data[i];
++    int index = noutputs + i;
++    AsmConstraint c = get_asm_constraint(arg);
++    if (arg->expr == NULL)
++      error("inline asm: input operand \"%s\" requires an expression", arg->constraint->str.buf);
++
++    enum AsmOperandKind kind = c.kind;
++    VReg *dst = NULL;
++    if (kind == AOK_TIED) {
++      // "0", "1", ...: same location as the referenced operand.  A digit is an
++      // *operand index*, not a register number: resolve it to that operand's
++      // slot and share the register, otherwise the tied input would get its own
++      // temporary and the template would name the wrong one.
++      int target = c.reg;
++      if (target < 0 || target >= index)
++        error("inline asm: matching constraint \"%s\" refers to a nonexistent operand",
++              arg->constraint->str.buf);
++      kind = slot_kind[target];
++      dst = slots[target];
++      switch (kind) {
++      case AOK_REG:
++        // Load the input value into the shared register.
++        new_ir_mov(dst, gen_expr(arg->expr));
++        break;
++      case AOK_MEM:
++        new_ir_mov(dst, gen_lval_addr(arg->expr));
++        break;
++      case AOK_IMM:
++        dst = gen_expr(arg->expr);
++        break;
++      default:
++        assert(false);
++        break;
++      }
++    } else {
++      switch (kind) {
++      case AOK_MEM:
++        {
++          dst = new_asm_operand_vreg(&tyVoidPtr, -1);
++          new_ir_mov(dst, gen_lval_addr(arg->expr));
++        }
++        break;
++      case AOK_IMM:
++        {
++          VReg *value = gen_expr(arg->expr);
++          if (!(value->flag & VRF_CONST))
++            error("inline asm: constraint \"%s\" requires a constant", arg->constraint->str.buf);
++          dst = value;
++        }
++        break;
++      case AOK_REG:
++        {
++          bool is_flo = (to_vflag(arg->expr->type) & VRF_FLONUM) != 0;
++          if (dst == NULL && c.reg < 0) {
++            // "r" asks for no particular register, so the value can be used where
++            // it already is: no copy is emitted, and a constant operand is
++            // substituted as an immediate.  (Templates that rely on the syscall
++            // argument registers -- like xcc's own libsrc/_syscall.h -- keep
++            // working because a parameter stays in its incoming register.)
++            if (is_flo && asm_template_names(asm_->templates, index)) {
++              // A floating point value can't be rendered as a general purpose
++              // register.  An unreferenced one is still useful: it pins the live
++              // range of a value the template reaches through its own hard coded
++              // register (e.g. libsrc/math/sqrt.c's "sqrtsd %xmm0, %xmm0").
++              error("inline asm: floating point register operands are not supported");
++            }
++            dst = gen_expr(arg->expr);
++            break;
++          }
++          if (is_flo)
++            error("inline asm: floating point register operands are not supported");
++          if (dst == NULL) {
++            // A fixed register that an output already asked for shares its
++            // temporary: both have to be in that register at the same time.
++            for (int j = 0; j < noutputs; ++j) {
++              if (slot_kind[j] == AOK_REG && out_reg[j] == c.reg &&
++                  slots[j]->vsize == to_vsize(arg->expr->type)) {
++                dst = slots[j];
++                break;
++              }
++            }
++            if (dst == NULL)
++              dst = new_asm_operand_vreg(arg->expr->type, c.reg);
++          }
++          new_ir_mov(dst, gen_expr(arg->expr));
++        }
++        break;
++      default:
++        assert(false);
++        break;
++      }
+     }
++
++    slots[index] = dst;
++    slot_kind[index] = kind;
++    AsmOperand *operand = calloc_or_die(sizeof(*operand));
++    operand->kind = kind;
++    vec_push(operands, operand);
+   }
+ 
+-  new_ir_asm(stmt->asm_.templates, output, registers);
++  // Operand 0 is the destination of the IR_ASM node only when it really is a
++  // register result; a memory operand is an input (the address), and making it
++  // the destination would let the dead code eliminator drop the statement.
++  VReg *output = NULL;
++  int first = 0;
++  if (noutputs > 0 && slot_kind[0] == AOK_REG) {
++    output = slots[0];
++    first = 1;
++  }
++  Vector *registers = new_vector();
++  for (int i = first; i < noperands; ++i)
++    vec_push(registers, slots[i]);
++
++  new_ir_asm(asm_->templates, operands, asm_->clobbers, output, registers);
++
++  // Assign the register results to their lvalues.  This has to happen *after*
++  // the asm statement (new_ir_* appends to the current basic block).
++  for (int i = 0; i < noutputs; ++i) {
++    if (slot_kind[i] == AOK_REG) {
++      const AsmArg *arg = asm_->outputs->data[i];
++      gen_asm_output_store(arg->expr, slots[i]);
++    }
++  }
+ }
+ 
+ VReg *gen_stmts(Vector *stmts) {
+diff --git a/src/cc/backend/codegen.h b/src/cc/backend/codegen.h
+index 268c637..7998fab 100644
+--- a/src/cc/backend/codegen.h
++++ b/src/cc/backend/codegen.h
+@@ -25,6 +25,9 @@ void gen(Vector *decls);
+ 
+ VReg *gen_expr(Expr *expr);
+ 
++// Address of an lvalue expression (used for "m" inline asm operands).
++VReg *gen_lval_addr(Expr *expr);
++
+ void gen_cond_jmp(Expr *cond, BB *tbb, BB *fbb);
+ 
+ void set_curbb(BB *bb);
+diff --git a/src/cc/backend/codegen_expr.c b/src/cc/backend/codegen_expr.c
+index 66ceaad..722fa30 100644
+--- a/src/cc/backend/codegen_expr.c
++++ b/src/cc/backend/codegen_expr.c
+@@ -245,6 +245,12 @@ static VReg *gen_ref_sub(Expr *expr) {
+             return varinfo->local.vreg;
+           }
+ #endif
++          // The address of the variable is about to be materialised: it has to
++          // live in the stack frame (inline asm "m" operands reach here without
++          // the front end ever seeing an '&').
++          VReg *vreg = varinfo->local.vreg;
++          if (vreg != NULL)
++            vreg->flag |= VRF_REF;
+           return new_ir_bofs(varinfo->local.frameinfo)->dst;
+         }
+         if (varinfo->storage & VS_STATIC)
+@@ -289,6 +295,10 @@ static VReg *gen_lval(Expr *expr) {
+   return gen_ref_sub(expr);
+ }
+ 
++VReg *gen_lval_addr(Expr *expr) {
++  return gen_ref_sub(expr);
++}
++
+ static VReg *gen_variable(Expr *expr) {
+   switch (expr->type->kind) {
+   case TY_FIXNUM:
+diff --git a/src/cc/backend/emit_code.c b/src/cc/backend/emit_code.c
+index 7df2206..9ace1e2 100644
+--- a/src/cc/backend/emit_code.c
++++ b/src/cc/backend/emit_code.c
+@@ -368,6 +368,7 @@ static void ei_asm(IR *ir) {
+   extern char *im(int64_t x);
+ 
+   Vector *templates = ir->asm_.templates;
++  Vector *operands = ir->asm_.operands;
+   Vector *registers = ir->additional_operands;
+   int dst_exists = ir->dst != NULL;
+   for (int i = 0, n = templates->len; i < n; i += 2) {
+@@ -377,7 +378,19 @@ static void ei_asm(IR *ir) {
+       uintptr_t index = (uintptr_t)templates->data[i + 1];
+       assert(index < (uintptr_t)(registers->len + dst_exists));
+       VReg *value = dst_exists && index == 0 ? ir->dst : registers->data[index - dst_exists];
+-      assert(!(value->flag & VRF_FLONUM));  // TODO:
++      enum AsmOperandKind kind = AOK_REG;
++      if (operands != NULL) {
++        assert(index < (uintptr_t)operands->len);
++        const AsmOperand *operand = operands->data[index];
++        kind = operand->kind;
++      }
++      // An immediate operand is substituted with its value (`$1234'); `im'
++      // already carries the `$' prefix of an AT&T immediate.
++      if (getenv("XCC_DBG_ASM") != NULL)
++        fprintf(stderr, "[emit] opnd %d virt=%d phys=%d flag=%x\n",
++                (int)index, value->virt, value->phys, value->flag);
++      assert(kind == AOK_REG || kind == AOK_IMM || kind == AOK_MEM);
++      assert(!(value->flag & VRF_FLONUM));  // TODO: Support floating point operands.
+       if (value->flag & VRF_CONST) {
+         emit_asm_raw(im(value->fixnum));
+       } else {
+@@ -385,7 +398,11 @@ static void ei_asm(IR *ir) {
+         int pow = value->vsize;
+         assert(0 <= pow && pow < 4);
+         const char **regs = kRegSizeTable[pow];
++        if (kind == AOK_MEM)
++          emit_asm_raw("(");
+         emit_asm_raw(regs[value->phys]);
++        if (kind == AOK_MEM)
++          emit_asm_raw(")");
+       }
+     }
+   }
+diff --git a/src/cc/backend/ir.c b/src/cc/backend/ir.c
+index db88bfc..172614c 100644
+--- a/src/cc/backend/ir.c
++++ b/src/cc/backend/ir.c
+@@ -360,9 +360,12 @@ IR *new_ir_keep(VReg *dst, VReg *opr1, VReg *opr2) {
+   return ir;
+ }
+ 
+-void new_ir_asm(Vector *templates, VReg *dst, Vector *registers) {
++void new_ir_asm(Vector *templates, Vector *operands, Vector *clobbers, VReg *dst,
++                Vector *registers) {
+   IR *ir = new_ir(IR_ASM);
+   ir->asm_.templates = templates;
++  ir->asm_.operands = operands;
++  ir->asm_.clobbers = clobbers;
+   ir->additional_operands = registers;
+   ir->dst = dst;
+ }
+diff --git a/src/cc/backend/ir.h b/src/cc/backend/ir.h
+index 1006aef..1f68679 100644
+--- a/src/cc/backend/ir.h
++++ b/src/cc/backend/ir.h
+@@ -38,10 +38,24 @@ enum VRegSize {
+ #define VRF_VOLATILEREG  (1 << 9)  // Volatile, but register
+ #define VRF_FP_GP_PARAM  (1 << 10) // FP, but passed by GP register
+ #define VRF_UNSIGNED     (1 << 11) // Unsigned
++#define VRF_FIXED_REG    (1 << 12) // Must be assigned to a specific physical register (inline asm operand)
+ 
+ #define VRF_MASK         (VRF_FLONUM | VRF_UNSIGNED)
+ #define VRF_FORCEMEMORY  (VRF_REF | VRF_SPILLED | VRF_VOLATILE)
+ 
++// How an inline asm operand is rendered into the template.
++enum AsmOperandKind {
++  AOK_REG,  // %N -> "%reg"        (register operand; "r", "a", "D", "S", "d", ...)
++  AOK_IMM,  // %N -> "$value"      (immediate operand; "i", "n", ...)
++  AOK_MEM,  // %N -> "(%reg)"      (memory operand; the value is the address)
++  AOK_TIED,  // Same as operand N ("0", "1", ...); resolved to the target's kind.
++  AOK_UNSUPPORTED,  // Constraint xcc cannot honour (e.g. x87/SSE register classes).
++};
++
++typedef struct {
++  enum AsmOperandKind kind;
++} AsmOperand;
++
+ typedef struct VReg {
+   enum VRegSize vsize;
+   int flag;
+@@ -52,6 +66,7 @@ typedef struct VReg {
+       int virt;             // Virtual reg no.
+       int phys;             // Physical reg no.
+       int reg_param_index;  // Index of function parameter through register: -1=non reg param.
++      int fixed_reg_index;  // Physical reg no required by VRF_FIXED_REG: -1=not fixed.
+       FrameInfo frame;      // FrameInfo for spilled register.
+     };
+ 
+@@ -185,7 +200,9 @@ typedef struct IR {
+       int index;
+     } result;
+     struct {
+-      Vector *templates;  // [const char*, (intptr_t)register-index, ...]
++      Vector *templates;  // [const char*, (intptr_t)operand-index, ...]
++      Vector *operands;   // <AsmOperand*> in template index order (may be NULL)
++      Vector *clobbers;   // <const char*> clobber list (may be NULL)
+     } asm_;
+   };
+ } IR;
+@@ -220,7 +237,7 @@ void new_ir_result(VReg *vreg, int index);
+ void new_ir_subsp(VReg *value, VReg *dst);
+ IR *new_ir_cast(VReg *vreg, enum VRegSize dstsize, int vflag);
+ IR *new_ir_keep(VReg *dst, VReg *opr1, VReg *opr2);
+-void new_ir_asm(Vector *templates, VReg *dst, Vector *registers);
++void new_ir_asm(Vector *templates, Vector *operands, Vector *clobbers, VReg *dst, Vector *registers);
+ 
+ IR *new_ir_load_spilled(VReg *vreg, VReg *src);
+ IR *new_ir_store_spilled(VReg *dst, VReg *vreg);
+diff --git a/src/cc/backend/regalloc.c b/src/cc/backend/regalloc.c
+index 7c59f9f..2afa33a 100644
+--- a/src/cc/backend/regalloc.c
++++ b/src/cc/backend/regalloc.c
+@@ -221,27 +221,146 @@ static void check_live_interval(BBContainer *bbcon, int vreg_count, LiveInterval
+   }
+ }
+ 
+-static void occupy_regs(RegAlloc *ra, Vector *actives, const unsigned long occupy[2]) {
+-  for (int k = 0; k < actives->len; ++k) {
+-    LiveInterval *li = actives->data[k];
+-    VReg *vreg = ra->vregs->data[li->virt];
+-    assert(vreg != NULL);
+-    bool is_flo = (vreg->flag & VRF_FLONUM) != 0;
+-    li->occupied_reg_bit |= occupy[is_flo];
++// ---------------------------------------------------------------------------
++// Bulk application of occupancy masks
++//
++// The old occupy_regs() walked **every active interval** for **each IR** -> O(#IR x active).
++// Whenever a function needs a stack frame, detect_extra_occupied() reports `%rbp` occupied for every IR
++// (see ir_x64.c), so the product is quadratic on huge functions: 2,000 simultaneously live locals
++// cost about 1 second per round, for 3 rounds.
++//
++// Now the scan only **records** (nip, mask); afterwards, for each live interval's covered range,
++// the masks are ORed into li->occupied_reg_bit. OR is idempotent, so a sparse table gives
++// O(m log m) preprocessing and O(1) answers for "OR of masks in [lo,hi]".
++//
++// Interval endpoints must match the old implementation **bit for bit** (otherwise register allocation changes):
++//   * extra/parameter masks are applied **before** expired intervals are removed, so intervals with end == nip still get
++//     -> range [start + 1, end] (inclusive);
++//   * IR_CALL clobber masks are applied **after** removal, when intervals with end == nip have already been
++//     removed -> range [start + 1, end - 1] (exclusive).
++//   * intervals with start < 0 (e.g. parameters) are live from the first IR, equivalent to start = -1.
++typedef struct {
++  int nip;
++  unsigned long mask[2];
++} OccupyMask;
++
++typedef struct {
++  OccupyMask *entries;
++  int count, cap;
++  unsigned long *table;  // [lane][level][index]
++  int levels, table_cap;
++} OccupyMaskSet;
++
++static OccupyMaskSet inclusive_occupy_masks, exclusive_occupy_masks;
++
++// Masks are recorded in increasing nip order (scan order).
++static void record_occupy_mask(OccupyMaskSet *set, int nip, const unsigned long mask[2]) {
++  if (mask[0] == 0 && mask[1] == 0)
++    return;
++  if (set->count >= set->cap) {
++    set->cap = set->cap > 0 ? set->cap * 2 : 64;
++    set->entries = realloc(set->entries, sizeof(OccupyMask) * set->cap);
++    assert(set->entries != NULL);
+   }
++  OccupyMask *e = &set->entries[set->count++];
++  e->nip = nip;
++  e->mask[0] = mask[0];
++  e->mask[1] = mask[1];
+ }
+ 
+-static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vreg_count,
+-                                       LiveInterval **sorted_intervals) {
+-  Vector *inactives = new_vector();
+-  Vector *actives = new_vector();
++// Build the sparse table; entry [lane][level][i] = OR of 2^level masks starting at i.
++static void build_occupy_mask_table(OccupyMaskSet *set) {
++  int n = set->count;
++  if (n <= 0)
++    return;
++  int levels = 0;
++  while ((1 << levels) <= n)
++    ++levels;
++  set->levels = levels;
++  int need = 2 * levels * n;
++  if (set->table_cap < need) {
++    set->table = realloc(set->table, sizeof(unsigned long) * need);
++    assert(set->table != NULL);
++    set->table_cap = need;
++  }
++  for (int lane = 0; lane < 2; ++lane) {
++    unsigned long *base = set->table + (size_t)lane * levels * n;
++    for (int i = 0; i < n; ++i)
++      base[i] = set->entries[i].mask[lane];
++    for (int l = 1, span = 1; l < levels; ++l, span <<= 1) {
++      unsigned long *prev = base + (size_t)(l - 1) * n;
++      unsigned long *cur = base + (size_t)l * n;
++      for (int i = 0; i + 2 * span <= n; ++i)
++        cur[i] = prev[i] | prev[i + span];
++    }
++  }
++}
++
++// Index of the first mask with nip >= pos.
++static int occupy_mask_lower_bound(const OccupyMaskSet *set, int pos) {
++  int lo = 0, hi = set->count;
++  while (lo < hi) {
++    int mid = lo + (hi - lo) / 2;
++    if (set->entries[mid].nip < pos)
++      lo = mid + 1;
++    else
++      hi = mid;
++  }
++  return lo;
++}
++
++// Index of the first mask with nip > pos.
++static int occupy_mask_upper_bound(const OccupyMaskSet *set, int pos) {
++  int lo = 0, hi = set->count;
++  while (lo < hi) {
++    int mid = lo + (hi - lo) / 2;
++    if (set->entries[mid].nip <= pos)
++      lo = mid + 1;
++    else
++      hi = mid;
++  }
++  return lo;
++}
++
++// OR of masks with nip in [lo, hi].
++static unsigned long query_occupy_masks(const OccupyMaskSet *set, int lane, int lo, int hi) {
++  int begin = occupy_mask_lower_bound(set, lo);
++  int end = occupy_mask_upper_bound(set, hi);
++  if (begin >= end)
++    return 0;
++  int len = end - begin;
++  int level = 0;
++  while ((1 << (level + 1)) <= len)
++    ++level;
++  const unsigned long *base = set->table + (size_t)lane * set->levels * set->count;
++  const unsigned long *lv = base + (size_t)level * set->count;
++  return lv[begin] | lv[end - (1 << level)];
++}
++
++static void apply_occupy_masks(RegAlloc *ra, LiveInterval **sorted_intervals, int vreg_count) {
++  if (inclusive_occupy_masks.count == 0 && exclusive_occupy_masks.count == 0)
++    return;
++  build_occupy_mask_table(&inclusive_occupy_masks);
++  build_occupy_mask_table(&exclusive_occupy_masks);
+   for (int i = 0; i < vreg_count; ++i) {
+     LiveInterval *li = sorted_intervals[i];
+     if (li->end < 0)
+       continue;
+-    vec_push(li->start < 0 ? actives : inactives, li);
++    VReg *vreg = ra->vregs->data[li->virt];
++    assert(vreg != NULL);
++    int lane = (vreg->flag & VRF_FLONUM) != 0 ? 1 : 0;
++    int lo = li->start < 0 ? 0 : li->start + 1;
++    if (lo <= li->end)
++      li->occupied_reg_bit |= query_occupy_masks(&inclusive_occupy_masks, lane, lo, li->end);
++    if (lo <= li->end - 1)
++      li->occupied_reg_bit |= query_occupy_masks(&exclusive_occupy_masks, lane, lo, li->end - 1);
+   }
++  inclusive_occupy_masks.count = 0;
++  exclusive_occupy_masks.count = 0;
++}
+ 
++static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vreg_count,
++                                       LiveInterval **sorted_intervals) {
+   const RegAllocSettings *settings = ra->settings;
+   int nip = 0;
+   unsigned long argset[2] = {0, 0};  // [0]=gp-reg, [1]=fp-reg
+@@ -254,19 +373,12 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
+         occupy[GPREG] = (*settings->detect_extra_occupied)(ra, ir);
+         if (occupy[GPREG] != 0) {
+           occupy[FPREG] = 0;
+-          occupy_regs(ra, actives, occupy);
++          record_occupy_mask(&inclusive_occupy_masks, nip, occupy);
+         }
+       }
+ 
+       if (argset[GPREG] != 0 || argset[FPREG] != 0)
+-        occupy_regs(ra, actives, argset);
+-
+-      // Deactivate registers which end at this ip.
+-      for (int k = 0; k < actives->len; ++k) {
+-        LiveInterval *li = actives->data[k];
+-        if (li->end <= nip)
+-          vec_remove_at(actives, k--);
+-      }
++        record_occupy_mask(&inclusive_occupy_masks, nip, argset);
+ 
+       switch (ir->kind) {
+       default: break;
+@@ -298,7 +410,7 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
+             broken[k] = (1UL << settings->regset[k].phys_temporary_count) - 1;
+             argset[k] = 0;
+           }
+-          occupy_regs(ra, actives, broken);
++          record_occupy_mask(&exclusive_occupy_masks, nip, broken);
+         }
+         break;
+ 
+@@ -319,19 +431,64 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
+         break;
+       }
+ 
+-      // Activate registers after usage checked.
+-      while (inactives->len > 0) {
+-        LiveInterval *li = inactives->data[0];
+-        if (li->start > nip)
+-          break;
+-        vec_remove_at(inactives, 0);
+-        vec_push(actives, li);
+-      }
+     }
+   }
+ 
+-  free_vector(inactives);
+-  free_vector(actives);
++  apply_occupy_masks(ra, sorted_intervals, vreg_count);
++}
++
++// Bitmask of the argument-passing registers that still hold a parameter value
++// at position `pos`.  A parameter arrives in its ABI register and stays there
++// until the prologue copies it elsewhere; only until that copy may nothing else
++// use the register.
++//
++// Note that the parameter's live interval spans the whole function (it also
++// covers the uses of the copied value), so it cannot be used here directly:
++// the register is released by the first instruction of the entry block that
++// writes it (the prologue move).
++// Intervals of parameters (values still in ABI registers). The parameter count is capped by the ABI register count (6 GPs on x64),
++// so collect them once and scan only these parameters per query -- the old code **rescanned all vregs for every interval**
++// (O(n^2); `scan` in linear_scan_register_allocation was the hotspot).
++typedef struct {
++  int start, end;
++  int bit;  // physical register number used by this parameter
++} ParamInterval;
++
++enum { MAX_PARAM_INTERVALS = 32 };
++
++static int collect_param_intervals(RegAlloc *ra, LiveInterval **sorted_intervals, int vreg_count,
++                                   ParamInterval *dst, int cap) {
++  int n = 0;
++  for (int i = 0; i < vreg_count; ++i) {
++    LiveInterval *li = sorted_intervals[i];
++    VReg *vreg = ra->vregs->data[li->virt];
++    if (vreg == NULL || vreg->reg_param_index < 0)
++      continue;
++    if (vreg->flag & VRF_FP_GP_PARAM)
++      continue;
++    int ip = ra->settings->reg_param_mapping[vreg->reg_param_index];
++    if (ip < 0)
++      continue;
++    assert(n < cap);
++    dst[n].start = li->start;
++    dst[n].end = li->end;
++    dst[n].bit = ip;
++    ++n;
++  }
++  return n;
++}
++
++static unsigned long live_param_mask(const ParamInterval *params, int nparams, int pos) {
++  // A parameter's value lives in its ABI register only until its last use (the
++  // prologue copies it out); after that the register is free for anything else.
++  // The parameter's live interval ends exactly at that last use, so testing the
++  // interval is both simpler and more accurate than walking the entry block.
++  unsigned long mask = 0;
++  for (int i = 0; i < nparams; ++i) {
++    if (params[i].start <= pos && pos <= params[i].end)
++      mask |= 1UL << params[i].bit;
++  }
++  return mask;
+ }
+ 
+ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_intervals,
+@@ -347,12 +504,80 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
+     p->used_bits = 0;
+   }
+ 
++  // Parameter intervals are collected only once (see collect_param_intervals).
++  ParamInterval param_intervals[MAX_PARAM_INTERVALS];
++  int param_count = collect_param_intervals(ra, sorted_intervals, vreg_count, param_intervals,
++                                            MAX_PARAM_INTERVALS);
++
++  // Inline asm operands are pinned to the register their constraint names
++  // ("=a", "D", "S", "d", ...).  Place them first and keep those registers
++  // reserved, because the asm template names the register itself: the operand
++  // has to be exactly there, and no other live value may take it.
++  unsigned long fixed_reserved[2] = {0, 0};
++  for (int i = 0; i < vreg_count; ++i) {
++    LiveInterval *li = sorted_intervals[i];
++    VReg *vreg = ra->vregs->data[li->virt];
++    if (vreg == NULL || (vreg->flag & VRF_FIXED_REG) == 0 || vreg->fixed_reg_index < 0)
++      continue;
++    if (li->state != LI_NORMAL)
++      continue;
++    bool is_flo = (vreg->flag & VRF_FLONUM) != 0;
++    int fixed = vreg->fixed_reg_index;
++    PhysicalRegisterSet *prsp = &regset[is_flo];
++    if (fixed >= prsp->phys_max)
++      continue;
++    // Retire intervals that have already ended and rebuild using_bits from the
++    // ones still live.  Without this the occupancy test below sees registers
++    // held by *dead* pinned intervals as still taken, because this pass never
++    // expired anything: two mutually exclusive branches that each have their
++    // own inline asm (e.g. musl's __stdio_read: `iov[0].len ? readv : read')
++    // both pin %rax/%rdi/%rsi/%rdx, and the second one was wrongly judged to
++    // conflict with the first (which ended long before) -> the operands were
++    // spilled and the asm ran with stale argument registers.
++    {
++      int w = 0;
++      unsigned long bits = 0;
++      for (int k = 0; k < prsp->active_count; ++k) {
++        LiveInterval *act = prsp->active[k];
++        if (act->end <= li->start)
++          continue;
++        prsp->active[w++] = act;
++        bits |= 1UL << act->phys;
++      }
++      prsp->active_count = w;
++      prsp->using_bits = bits;
++      prsp->used_bits |= bits;
++    }
++    fixed_reserved[is_flo] |= 1UL << fixed;
++
++    if ((prsp->using_bits & (1UL << fixed)) == 0) {
++      li->phys = fixed;
++      prsp->using_bits |= 1UL << fixed;
++      insert_active(prsp->active, prsp->active_count, li);
++      ++prsp->active_count;
++      prsp->used_bits |= prsp->using_bits;
++    } else {
++      // Another pinned operand already holds this register; no code sequence
++      // could satisfy both constraints.
++      li->state = LI_SPILL;
++    }
++  }
++  // Oldest start first, so that expire_old_intervals() can retire them.
++  for (int i = 0; i < (int)ARRAY_SIZE(regset); ++i)
++    qsort(regset[i].active, regset[i].active_count, sizeof(LiveInterval*), sort_live_interval);
++
+   for (int i = 0; i < vreg_count; ++i) {
+     LiveInterval *li = sorted_intervals[i];
+     if (ra->vregs->data[li->virt] == NULL)
+       continue;
+     if (li->state != LI_NORMAL)
+       continue;
++    {
++      VReg *v = ra->vregs->data[li->virt];
++      if ((v->flag & VRF_FIXED_REG) != 0 && v->fixed_reg_index >= 0 &&
++          li->phys == v->fixed_reg_index)
++        continue;  // Already placed by the pinned-operand pass above.
++    }
+     expire_old_intervals(&regset[GPREG], li->start);
+     expire_old_intervals(&regset[FPREG], li->start);
+ 
+@@ -362,6 +587,14 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
+     int start_index = 0;
+     int regno = -1;
+     int ip = vreg->reg_param_index;
++    // Registers that must stay untouched here: those a still-live parameter
++    // occupies (it is in its ABI register until the prologue copies it out) and
++    // those a pinned operand holds (an inline asm constraint, or a GNU register
++    // variable -- the asm / `syscall` reads them directly).  Note this is not
++    // folded into `occupied` for the *preferred* register below, which is the
++    // parameter's own ABI register.
++    unsigned long param_mask = is_flo ? 0 : live_param_mask(param_intervals, param_count, li->start);
++    unsigned long reserved = fixed_reserved[is_flo] | param_mask;
+     unsigned long occupied = prsp->using_bits | li->occupied_reg_bit;
+     if (ip >= 0 && !(vreg->flag & VRF_FP_GP_PARAM)) {
+       if (is_flo) {
+@@ -371,23 +604,26 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
+         ip = ra->settings->reg_param_mapping[ip];
+       }
+ 
+-      if (ip >= 0 && !(occupied & (1UL << ip)))
++      if (ip >= 0 && !((occupied | (reserved & ~(1UL << ip))) & (1UL << ip)))
+         regno = ip;
+       else
+         start_index = prsp->phys_temporary;
+     }
+     if (regno < 0) {
+       for (int j = start_index; j < prsp->phys_max; ++j) {
+-        if (!(occupied & (1UL << j))) {
++        if (!(occupied & (1UL << j)) && !(reserved & (1UL << j))) {
+           regno = j;
+           break;
+         }
+       }
+     }
++    if (getenv("XCC_DBG_RA") != NULL)
++      fprintf(stderr, "[alloc] virt=%d start=%d end=%d flag=%x param=%d reg=%d fixed=%d\n",
++              vreg->virt, li->start, li->end, vreg->flag, vreg->reg_param_index, regno,
++              (vreg->flag & VRF_FIXED_REG) ? vreg->fixed_reg_index : -1);
+     if (regno >= 0) {
+       li->phys = regno;
+       prsp->using_bits |= 1UL << regno;
+-
+       insert_active(prsp->active, prsp->active_count, li);
+       ++prsp->active_count;
+     } else {
+diff --git a/src/cc/backend/regalloc.h b/src/cc/backend/regalloc.h
+index fa016c1..4498295 100644
+--- a/src/cc/backend/regalloc.h
++++ b/src/cc/backend/regalloc.h
+@@ -29,6 +29,7 @@ typedef struct LiveInterval {
+ 
+ typedef struct RegAllocSettings {
+   unsigned long (*detect_extra_occupied)(RegAlloc *ra, IR *ir);
++  unsigned long (*detect_asm_occupied)(IR *ir);  // Registers an inline asm clobbers.
+   const int *reg_param_mapping;
+   const int *reg_return_mapping;
+   struct {
+diff --git a/src/cc/frontend/ast.c b/src/cc/frontend/ast.c
+index 3d0c39c..63805f5 100644
+--- a/src/cc/frontend/ast.c
++++ b/src/cc/frontend/ast.c
+@@ -301,11 +301,12 @@ Stmt *new_stmt_vardecl(VarDecl *vardecl) {
+ }
+ 
+ Stmt *new_stmt_asm(const Token *token, Vector *templates, Vector *outputs, Vector *inputs,
+-                   int flag) {
++                   Vector *clobbers, int flag) {
+   Stmt *stmt = new_stmt(ST_ASM, token);
+   stmt->asm_.templates = templates;
+   stmt->asm_.outputs = outputs;
+   stmt->asm_.inputs = inputs;
++  stmt->asm_.clobbers = clobbers;
+   stmt->asm_.flag = flag;
+   return stmt;
+ }
+diff --git a/src/cc/frontend/ast.h b/src/cc/frontend/ast.h
+index d40a42e..b71fa4b 100644
+--- a/src/cc/frontend/ast.h
++++ b/src/cc/frontend/ast.h
+@@ -374,6 +374,7 @@ typedef struct {
+   Vector *templates;  // [const char*, (uintptr_t)index, ...]
+   Vector *outputs;  // <AsmArg*>
+   Vector *inputs;   // <AsmArg*>
++  Vector *clobbers;  // <const char*> clobber list ("rcx", "memory", ...)
+   int flag;
+ } Asm;
+ 
+@@ -460,6 +461,7 @@ Stmt *new_stmt_goto(const Token *tok, const Token *label);
+ Stmt *new_stmt_label(const Token *label, Stmt *follow);
+ Stmt *new_stmt_vardecl(VarDecl *vardecl);
+ Stmt *new_stmt_asm(const Token *token, Vector *template_, Vector *outputs, Vector *inputs,
++                   Vector *clobbers,
+                    int flag);
+ 
+ // ================================================
+diff --git a/src/cc/frontend/fe_misc.c b/src/cc/frontend/fe_misc.c
+index e990d0c..d456f10 100644
+--- a/src/cc/frontend/fe_misc.c
++++ b/src/cc/frontend/fe_misc.c
+@@ -315,6 +315,14 @@ static void mark_var_used_sub(Expr *expr, bool for_func) {
+         const Type *type = varinfo->type;
+         if (type->kind == TY_FUNC && !for_func) {
+           varinfo->storage |= VS_REF_TAKEN;
++        } else if (varinfo->storage & VS_STATIC) {
++          // A file-scope static that is actually referenced must be emitted even
++          // when the only code path referencing it is dropped (e.g. the
++          // reference lives in a function that is not emitted because it is
++          // reached solely through a weak alias).  Without this the definition
++          // is skipped while the reference is still emitted, producing an
++          // undefined symbol.
++          varinfo->storage |= VS_USED;
+         }
+       } else {
+         varinfo->storage |= VS_USED;
+@@ -1216,6 +1224,11 @@ static Stmt *dup_stmt_vardecl(Function *targetfunc, Scope *targetscope, Stmt *st
+     return NULL;
+   VarInfo *varinfo = scope_find(curscope, d->varinfo->ident->ident, NULL);
+   assert(varinfo != NULL);
++  // A GNU register variable must keep its pinned register in the inlined copy:
++  // musl's __syscall4/5/6 are `static __inline` and pin %r10/%r8/%r9, which the
++  // `asm` then reads to build the syscall arguments.
++  if (d->varinfo->asm_reg != NULL)
++    varinfo->asm_reg = d->varinfo->asm_reg;
+   VarDecl *decl = new_vardecl(varinfo);
+   decl->init_stmt = duplicate_inline_function_stmt(targetfunc, targetscope, d->init_stmt);
+   return new_stmt_vardecl(decl);
+@@ -1239,7 +1252,8 @@ static Vector *duplicate_inline_function_asm_args(Function *targetfunc, Scope *t
+ static Stmt *dup_stmt_asm(Function *targetfunc, Scope *targetscope, Stmt *stmt) {
+   Vector *outputs = duplicate_inline_function_asm_args(targetfunc, targetscope, stmt->asm_.outputs);
+   Vector *inputs = duplicate_inline_function_asm_args(targetfunc, targetscope, stmt->asm_.inputs);
+-  Stmt *dup = new_stmt_asm(stmt->token, stmt->asm_.templates, outputs, inputs, stmt->asm_.flag);
++  Stmt *dup = new_stmt_asm(stmt->token, stmt->asm_.templates, outputs, inputs,
++                             stmt->asm_.clobbers, stmt->asm_.flag);
+   return dup;
+ }
+ 
+diff --git a/src/cc/frontend/lexer.c b/src/cc/frontend/lexer.c
+index 92ee651..fb5e33c 100644
+--- a/src/cc/frontend/lexer.c
++++ b/src/cc/frontend/lexer.c
+@@ -41,7 +41,7 @@ static const struct {
+   {"static", TK_STATIC},
+   {"inline", TK_INLINE}, {"__inline", TK_INLINE}, {"__inline__", TK_INLINE},
+   {"extern", TK_EXTERN},
+-  {"volatile", TK_VOLATILE},
++  {"volatile", TK_VOLATILE}, {"__volatile", TK_VOLATILE}, {"__volatile__", TK_VOLATILE},
+   {"restrict", TK_RESTRICT},
+   {"auto", TK_AUTO},
+   {"register", TK_REGISTER},
+diff --git a/src/cc/frontend/parser.c b/src/cc/frontend/parser.c
+index 3336d6b..4193927 100644
+--- a/src/cc/frontend/parser.c
++++ b/src/cc/frontend/parser.c
+@@ -269,6 +269,8 @@ static Vector *parse_vardecl_cont(Type *type, ParsedTypeInfo *tinfo) {
+ #endif
+ 
+     VarInfo *varinfo = add_var_to_scope(curscope, tinfo->ident, type, tinfo->storage, false);
++    if (tinfo->asm_reg != NULL)
++      varinfo->asm_reg = tinfo->asm_reg->str.buf;
+     if (type->kind != TY_FUNC) {
+       Initializer *init = match(TK_ASSIGN) ? parse_initializer() : NULL;
+ 
+@@ -606,7 +608,7 @@ static inline Stmt *parse_return(const Token *tok) {
+   return new_stmt_return(tok, val);
+ }
+ 
+-static Vector *parse_asm_arg(bool param) {
++static Vector *parse_asm_arg(bool param, bool require_lvalue) {
+   const Token *constraint = match(TK_STR);
+   if (constraint == NULL)
+     return NULL;
+@@ -617,6 +619,10 @@ static Vector *parse_asm_arg(bool param) {
+       Expr *expr = parse_assign();
+       consume(TK_RPAR, "`)' expected");
+ 
++      // An output operand is written back to, so it has to be an lvalue.
++      if (require_lvalue)
++        check_lval(expr->token, expr, "Cannot assign");
++
+       AsmArg *arg = calloc_or_die(sizeof(*arg));
+       arg->constraint = constraint;
+       arg->expr = expr;
+@@ -645,20 +651,20 @@ static Stmt *parse_asm(const Token *tok) {
+     return new_stmt(ST_EMPTY, tok);
+   }
+ 
+-  Vector *outputs = NULL, *inputs = NULL, *clobbers, *labels;
++  Vector *outputs = NULL, *inputs = NULL, *clobbers = NULL, *labels = NULL;
+   if (match(TK_COLON)) {
+-    outputs = parse_asm_arg(true);
++    outputs = parse_asm_arg(true, true);
+     if (match(TK_COLON)) {
+-      inputs = parse_asm_arg(true);
++      inputs = parse_asm_arg(true, false);
+       if (match(TK_COLON)) {
+-        clobbers = parse_asm_arg(false);
++        clobbers = parse_asm_arg(false, false);
+         if (match(TK_COLON)) {
+-          labels = parse_asm_arg(false);
++          labels = parse_asm_arg(false, false);
+         }
+       }
+     }
+   }
+-  UNUSED(clobbers);  // TODO
++  // Clobber list is handed over to the register allocator (see gen_asm).
+   UNUSED(labels);  // TODO
+ 
+   consume(TK_RPAR, "`)' expected");
+@@ -705,7 +711,7 @@ static Stmt *parse_asm(const Token *tok) {
+     }
+   }
+ 
+-  return new_stmt_asm(tok, templates, outputs, inputs, flag);
++  return new_stmt_asm(tok, templates, outputs, inputs, clobbers, flag);
+ }
+ 
+ static inline const Token *parse_stmts(Stmt *parent, Vector *stmts) {
+diff --git a/src/cc/frontend/parser.h b/src/cc/frontend/parser.h
+index bc04d0e..d41b2f6 100644
+--- a/src/cc/frontend/parser.h
++++ b/src/cc/frontend/parser.h
+@@ -21,6 +21,7 @@ typedef struct {
+   Type *rawType;
+   int storage;
+   Token *ident;
++  Token *asm_reg;  // `__asm__("r10")` in a declarator (GNU register variables).
+   Table *attributes;  // <Vector<Expr*>>
+ } ParsedTypeInfo;
+ 
+diff --git a/src/cc/frontend/parser_type.c b/src/cc/frontend/parser_type.c
+index 8e065ba..7a95b7e 100644
+--- a/src/cc/frontend/parser_type.c
++++ b/src/cc/frontend/parser_type.c
+@@ -625,6 +625,8 @@ static Type *parse_direct_declarator_suffix(Type *type) {
+ }
+ Type *parse_direct_declarator(Type *type, ParsedTypeInfo *tinfo) {
+   Token *ident = NULL;
++  if (tinfo != NULL)
++    tinfo->asm_reg = NULL;  // Callers declare ParsedTypeInfo uninitialised.
+   if (match(TK_LPAR)) {
+     tinfo->attributes = parse_attributes(tinfo->attributes);
+ 
+@@ -641,6 +643,14 @@ Type *parse_direct_declarator(Type *type, ParsedTypeInfo *tinfo) {
+     memcpy(placeholder, inner, sizeof(*placeholder));
+   } else {
+     ident = match(TK_IDENT);
++    // GNU register variable: `register long r10 __asm__("r10") = ...`.
++    if (ident != NULL && match(TK_ASM)) {
++      consume(TK_LPAR, "`(' expected");
++      Token *reg = consume(TK_STR, "string literal expected");
++      consume(TK_RPAR, "`)' expected");
++      if (tinfo != NULL)
++        tinfo->asm_reg = reg;
++    }
+     type = parse_direct_declarator_suffix(type);
+   }
+ 
+diff --git a/src/cc/frontend/var.h b/src/cc/frontend/var.h
+index 8b00ee3..fbbae80 100644
+--- a/src/cc/frontend/var.h
++++ b/src/cc/frontend/var.h
+@@ -38,6 +38,7 @@ typedef struct VarInfo {
+   const Token *ident;
+   Type *type;
+   int storage;
++  const char *asm_reg;  // `register long x __asm__("r10")`: pinned register name, or NULL.
+   union {
+     struct {
+       Initializer *init;
+diff --git a/src/ld/ld.c b/src/ld/ld.c
+index 790f940..03c73fc 100644
+--- a/src/ld/ld.c
++++ b/src/ld/ld.c
+@@ -19,7 +19,13 @@
+ 
+ static const char kDefaultEntryName[] = "_start";
+ 
+-#define PROG_START          (0x100)
++// The ELF header and the program header table live in [0, PROG_START) and get
++// their own read-only PT_LOAD, so that the kernel can report a non-zero AT_PHDR
++// (see out_phdr_self).  That table is sizeof(Elf64_Ehdr) + phnum *
++// sizeof(Elf64_Phdr) bytes -- 64 + 5*56 = 344 for a typical static binary --
++// which no longer fits the old 0x100; keep it page aligned, matching the first
++// section group's alignment.
++#define PROG_START          (0x1000)
+ #define CODE_START_ADDRESS  (0x01000000 + PROG_START)
+ #define DATA_START_ADDRESS  (0x10000000)
+ #define TEXT_ALIGN          (4)
+@@ -797,6 +803,14 @@ static bool ld_output_exe(LinkEditor *ld, const char *ofn, uint64_t entry_addres
+   uint64_t shstrtab_ofs = offset = ALIGN(offset + symtab->strtab.size, ELF_MIN_ALIGN);
+   uint64_t sh_ofs = offset = ALIGN(offset + shstrtab.size, ELF_MIN_ALIGN);
+ 
++  // The phdr table gets two extra entries: PT_PHDR (describing the table
++  // itself) and a read-only PT_LOAD covering the ELF header and that table in
++  // [0, PROG_START).  PT_PHDR must come first and be covered by a LOAD, and it
++  // is what makes the kernel report a non-zero AT_PHDR -- musl locates its own
++  // phdrs through AT_PHDR in __init_libc/__init_tls.
++  const int head_phnum = phnum + 2;
++  const uint64_t head_vaddr = CODE_START_ADDRESS - PROG_START;
++
+   int shnum = phnum + 4;  // null, symtab, strtab, shstrtab
+ 
+ #if XCC_TARGET_ARCH == XCC_ARCH_RISCV64
+@@ -804,7 +818,10 @@ static bool ld_output_exe(LinkEditor *ld, const char *ofn, uint64_t entry_addres
+ #else
+   const int flags = 0;
+ #endif
+-  out_elf_header(fp, entry_address, phnum, shnum, flags, sh_ofs);
++  out_elf_header(fp, entry_address, head_phnum, shnum, flags, sh_ofs);
++
++  out_phdr_self(fp, sizeof(Elf64_Ehdr), head_vaddr + sizeof(Elf64_Ehdr), head_phnum);
++  out_program_header(fp, 0, head_vaddr, PROG_START, PROG_START, PF_R);
+ 
+   offset = PROG_START;
+   for (int sec = 0; sec < SECTION_COUNT; ++sec) {
+diff --git a/src/util/bin_util.c b/src/util/bin_util.c
+index 4bc18cc..6bb3b4d 100644
+--- a/src/util/bin_util.c
++++ b/src/util/bin_util.c
+@@ -145,4 +145,25 @@ void out_program_header(FILE *fp, uintptr_t offset, uintptr_t vaddr, size_t file
+ 
+   fwrite(&phdr, sizeof(Elf64_Phdr), 1, fp);
+ }
++
++// The program header table describing itself (PT_PHDR).
++//
++// The kernel only reports AT_PHDR (the address of the program header table) to
++// the program when the executable carries a PT_PHDR entry; without it AT_PHDR
++// stays 0 and a C library that locates its own phdrs through AT_PHDR (musl's
++// __init_libc -> __init_tls does) dereferences the null pointer.
++void out_phdr_self(FILE *fp, uintptr_t offset, uintptr_t vaddr, size_t phnum) {
++  Elf64_Phdr phdr = {
++    .p_type   = PT_PHDR,
++    .p_offset = offset,
++    .p_vaddr  = vaddr,
++    .p_paddr  = vaddr,  // dummy
++    .p_filesz = phnum * sizeof(Elf64_Phdr),
++    .p_memsz  = phnum * sizeof(Elf64_Phdr),
++    .p_flags  = PF_R,
++    .p_align  = 8,
++  };
++
++  fwrite(&phdr, sizeof(Elf64_Phdr), 1, fp);
++}
+ #endif  // !ELF_NOT_SUPPORTED
+diff --git a/src/util/bin_util.h b/src/util/bin_util.h
+index bce5b11..338db28 100644
+--- a/src/util/bin_util.h
++++ b/src/util/bin_util.h
+@@ -48,3 +48,6 @@ void symtab_concat(Symtab *dest, Symtab *src);
+ void out_elf_header(FILE *fp, uintptr_t entry, int phnum, int shnum, int flags, uintptr_t shoff);
+ void out_program_header(FILE *fp, uintptr_t offset, uintptr_t vaddr, size_t filesz, size_t memsz,
+                         int flags);
++// Emit the PT_PHDR entry describing the program header table itself; the kernel
++// needs it to pass a non-zero AT_PHDR to the program.
++void out_phdr_self(FILE *fp, uintptr_t offset, uintptr_t vaddr, size_t phnum);

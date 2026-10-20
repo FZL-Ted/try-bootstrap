@@ -1,0 +1,441 @@
+--- a/src/cc/frontend/parser.c
++++ b/src/cc/frontend/parser.c
+@@ -96,19 +96,169 @@
+       parse_error(PE_NOFATAL, expr->token, "non negative integer required");
+     else
+       index = expr->fixnum;
++    // GCC extension: `[lo ... hi] = value` designates a range of elements.
++    bool is_range = false;
++    size_t index2 = index;
++    if (match(TK_ELLIPSIS) != NULL) {
++      is_range = true;
++      Expr *expr2 = parse_const_fixnum();
++      if (expr2->fixnum < 0)
++        parse_error(PE_NOFATAL, expr2->token, "non negative integer required");
++      else
++        index2 = expr2->fixnum;
++    }
+     consume(TK_RBRACKET, "`]' expected");
+     Initializer *value = parse_initializer_multi();
+     if (value == NULL) {
+       match(TK_ASSIGN);  // both accepted: `[1] = 2`, and `[1] 2`
+       value = parse_initializer();
+     }
+-    init = new_initializer(IK_BRKT, tok);
+-    init->bracket.index = index;
+-    init->bracket.value = value;
++    if (is_range) {
++      init = new_initializer(IK_RANGE, tok);
++      init->range.index = index;
++      init->range.index2 = index2;
++      init->range.value = value;
++    } else {
++      init = new_initializer(IK_BRKT, tok);
++      init->bracket.index = index;
++      init->bracket.value = value;
++    }
+   }
+   return init;
+ }
+ 
++// ---- GCC range designators (`[lo ... hi] = value`) -------------------------
++// GCC accepts `[lo ... hi] = value` in initializer lists to initialize a *range*
++// of array elements with the same value, e.g.
++//     struct S s = { .a[0 ... MAX_OPERANDS - 1] = -1 };
++// (binutils-2.44's `opcodes/i386-dis.c` uses exactly this shape.)
++//
++// xcc used to reject it (`]' expected).  We accept it by expanding the range
++// into a sequence of ordinary `[n] = value` designators **at parse time**, so
++// every later pass (flatten_initializer / check_global_initializer / ...) only
++// ever sees IK_BRKT/IK_DOT and needs no change at all.
++static Initializer *clone_initializer(const Initializer *init);
++
++// Returns NULL when `init` contains no range designator (nothing to rewrite),
++// otherwise a vector of replacement elements (with all ranges expanded).
++static Vector *expand_range_initializer(Initializer *init);
++
++// Expand range designators inside one `{...}` list, in place.
++static void expand_range_designators(Initializer *init) {
++  assert(init->kind == IK_MULTI);
++  Vector *multi = init->multi;
++  Vector *out = NULL;
++  for (int i = 0; i < multi->len; ++i) {
++    Initializer *elem = multi->data[i];
++    Vector *ex = elem != NULL ? expand_range_initializer(elem) : NULL;
++    if (ex == NULL) {
++      if (out != NULL)
++        vec_push(out, elem);
++      continue;
++    }
++    if (out == NULL) {  // Lazy copy: no allocation unless a range is found.
++      out = new_vector();
++      for (int j = 0; j < i; ++j)
++        vec_push(out, multi->data[j]);
++    }
++    for (int j = 0; j < ex->len; ++j)
++      vec_push(out, ex->data[j]);
++  }
++  if (out != NULL)
++    init->multi = out;
++}
++
++static Vector *expand_range_initializer(Initializer *init) {
++  switch (init->kind) {
++  case IK_RANGE:
++    {
++      Vector *out = new_vector();
++      for (size_t i = init->range.index; i <= init->range.index2; ++i) {
++        Initializer *value = clone_initializer(init->range.value);
++        Vector *sub = expand_range_initializer(value);
++        if (sub == NULL) {
++          Initializer *brkt = new_initializer(IK_BRKT, init->token);
++          brkt->bracket.index = i;
++          brkt->bracket.value = value;
++          vec_push(out, brkt);
++        } else {
++          for (int j = 0; j < sub->len; ++j) {
++            Initializer *brkt = new_initializer(IK_BRKT, init->token);
++            brkt->bracket.index = i;
++            brkt->bracket.value = sub->data[j];
++            vec_push(out, brkt);
++          }
++        }
++        if (i == init->range.index2)
++          break;  // Guard against wraparound when index2 == SIZE_MAX.
++      }
++      return out;
++    }
++  case IK_DOT:
++  case IK_BRKT:
++    {
++      Initializer *inner = init->kind == IK_DOT ? init->dot.value : init->bracket.value;
++      Vector *sub = expand_range_initializer(inner);
++      if (sub == NULL)
++        return NULL;
++      Vector *out = new_vector();
++      for (int j = 0; j < sub->len; ++j) {
++        Initializer *node = new_initializer(init->kind, init->token);
++        if (init->kind == IK_DOT) {
++          node->dot.name = init->dot.name;
++          node->dot.value = sub->data[j];
++        } else {
++          node->bracket.index = init->bracket.index;
++          node->bracket.value = sub->data[j];
++        }
++        vec_push(out, node);
++      }
++      return out;
++    }
++  case IK_MULTI:
++    expand_range_designators(init);  // A nested `{...}` can hold ranges, too.
++    return NULL;
++  default:
++    return NULL;
++  }
++}
++
++// Note: the leaf value is cloned per expanded element, so that a later pass
++// which rewrites an initializer (e.g. check_global_initializer() casting the
++// value) does not see the very same node several times.
++static Initializer *clone_initializer(const Initializer *init) {
++  if (init == NULL)
++    return NULL;
++  Initializer *clone = new_initializer(init->kind, init->token);
++  switch (init->kind) {
++  case IK_SINGLE:
++    clone->single = init->single;
++    break;
++  case IK_MULTI:
++    {
++      Vector *multi = new_vector();
++      for (int i = 0; i < init->multi->len; ++i)
++        vec_push(multi, clone_initializer(init->multi->data[i]));
++      clone->multi = multi;
++      break;
++    }
++  case IK_DOT:
++    clone->dot.name = init->dot.name;
++    clone->dot.value = clone_initializer(init->dot.value);
++    break;
++  case IK_BRKT:
++    clone->bracket.index = init->bracket.index;
++    clone->bracket.value = clone_initializer(init->bracket.value);
++    break;
++  case IK_RANGE:
++    clone->range.index = init->range.index;
++    clone->range.index2 = init->range.index2;
++    clone->range.value = clone_initializer(init->range.value);
++    break;
++  }
++  return clone;
++}
++
+ // <initializer> ::= <assignment-expression>
+ //                 | { <initializer-list> }
+ //                 | { <initializer-list> , }
+@@ -136,6 +286,7 @@
+     }
+     result = new_initializer(IK_MULTI, lblace_tok);
+     result->multi = multi;
++    expand_range_designators(result);  // GCC `[lo ... hi] = v` (see above)
+   } else {
+     Expr *value = parse_assign();
+     value = used_as_value(value);
+@@ -396,10 +547,34 @@
+   return -1;
+ }
+ 
++// Upper bound for expanding a GCC `case lo ... hi:` range into individual case
++// labels.  binutils only uses tiny ranges (e.g. 0x50 ... 0x57); the bound keeps
++// a pathological range from exploding the label list.
++enum { MAX_CASE_RANGE_VALUES = 4096 };
++
+ static Stmt *parse_case(const Token *tok) {
+   Expr *value = NULL;
+-  if (tok->kind == TK_CASE)
++  bool is_range = false;
++  Fixnum range_from = 0, range_to = 0;
++  if (tok->kind == TK_CASE) {
+     value = parse_const_fixnum();
++    // GCC extension: `case lo ... hi:` designates a *range* of values.
++    // (binutils' gas/config/tc-i386-ginsn.c uses it, e.g. `case 0x50 ... 0x57:`.)
++    if (match(TK_ELLIPSIS) != NULL) {
++      Expr *to = parse_const_fixnum();
++      is_range = true;
++      range_from = value->fixnum;
++      range_to = to->fixnum;
++      if (range_to < range_from) {
++        parse_error(PE_NOFATAL, tok, "empty case range");
++        range_to = range_from;  // Degrade to a single value.
++      } else if ((UFixnum)(range_to - range_from) >= MAX_CASE_RANGE_VALUES) {
++        parse_error(PE_NOFATAL, tok, "case range `%" PRId64 " ... %" PRId64 "' is too large",
++                    range_from, range_to);
++        range_to = range_from;
++      }
++    }
++  }
+   consume(TK_COLON, "`:' expected");
+ 
+   Stmt *swtch = loop_scope.swtch;
+@@ -409,6 +584,38 @@
+     return parse_stmt();  // Expecting next statement.
+   }
+ 
++  if (is_range) {
++    // `case lo ... hi:` is equivalent to the label chain
++    //     case lo: case lo+1: ... case hi: <stmt>
++    // Register every label *before* parsing the statement, so that duplicate
++    // detection (find_case) sees them exactly like the single-value path.
++    Vector *labels = new_vector();
++    for (Fixnum v = range_from; ; ++v) {
++      if (find_case(swtch, v) >= 0)
++        parse_error(PE_NOFATAL, tok, "case value `%" PRId64 "' already defined", v);
++      Expr *cv = make_cast(swtch->switch_.value->type, tok,
++                           new_expr_fixlit(&tyInt, tok, v), false);
++      Stmt *c = new_stmt_case(tok, swtch, cv);
++      vec_push(swtch->switch_.cases, c);
++      vec_push(labels, c);
++      if (v == range_to)
++        break;  // Guard against overflow at the top of Fixnum.
++    }
++
++    Stmt *next = parse_stmt();
++    if (next == NULL) {
++      parse_error(PE_NOFATAL, tok, "statement expected");
++      next = new_stmt(ST_EMPTY, tok);  // Dummy
++    }
++    for (int i = 0; i < labels->len; ++i) {
++      Stmt *c = labels->data[i];
++      Stmt *body = i + 1 < labels->len ? (Stmt*)labels->data[i + 1] : next;
++      c->case_.stmt = body;
++      body->parent = c;
++    }
++    return labels->data[0];
++  }
++
+   if (value != NULL) {
+     if (find_case(swtch, value->fixnum) >= 0) {
+       parse_error(PE_NOFATAL, tok, "case value `%" PRId64 "' already defined", value->fixnum);
+@@ -439,8 +646,19 @@
+ 
+ static Stmt *parse_while(const Token *tok) {
+   consume(TK_LPAR, "`(' expected");
+-  Expr *cond = make_cond(parse_expr());
+-  cond = used_as_value(cond);
++  // ★ Order matters: `used_as_value()` **before** `make_cond()`.
++  //   For a bitfield read used as a value, used_as_value() is what inserts the
++  //   shift/mask (`extract_bitfield_value()`); make_cond() instead wraps the
++  //   expression into `<expr> != 0`, and used_as_value() only inspects the top
++  //   node — so the reversed order left a bare bitfield read unextracted:
++  //       while (p->b) ...        // tested the whole underlying word
++  //   (binutils' gas has exactly this shape:
++  //       while (i.tm.operand_types[dest].bitfield.instance) --dest;
++  //    which ran off the array and made the freshly built `as` segfault on every
++  //    two-operand instruction.)  parse_if()/parse_do_while()/parse_for() already
++  //   use the right order; this one was the odd one out.
++  Expr *cond = used_as_value(parse_expr());
++  cond = make_cond(cond);
+   consume(TK_RPAR, "`)' expected");
+ 
+   Stmt *stmt = new_stmt_while(tok, cond, NULL);
+--- a/src/cc/frontend/lexer.c
++++ b/src/cc/frontend/lexer.c
+@@ -711,6 +711,47 @@
+   return NULL;
+ }
+ 
++// Scan a "pp-number" (C99 6.4.8).  This is **preprocessor-only** tokenization:
++// the preprocessor has to keep things like `3DNOW`, `1B` or `1.2.3` as *one*
++// token, because `##` pastes raw pp-number text.  binutils' gas does exactly
++// that (gas/config/tc-i386.c):
++//     #define SUBARCH(n, e, d, s) ... CPU_ ## e ## _FLAGS ...
++//     SUBARCH (3dnow, 3DNOW, ANY_3DNOW, false)
++// so `CPU_ ## 3DNOW ## _FLAGS` must glue into the single identifier
++// `CPU_3DNOW_FLAGS`.  `read_num` only accepts real C literals, hence it used to
++// split `3DNOW` into `3` + `DNOW` and the paste produced two wrong tokens.
++static Token *read_pp_number(const char **pp) {
++  const char *start = *pp, *p = start;
++  if (*p == '.')
++    ++p;  // `.` digit
++  for (;; ++p) {
++    unsigned char c = *p;
++    if (isalnum(c) || c == '_' || c == '.')
++      continue;
++    if ((c == '+' || c == '-') && p > start &&
++        (tolower(p[-1]) == 'e' || tolower(p[-1]) == 'p'))
++      continue;
++    break;
++  }
++
++  // If the text is a valid C literal on its own, keep the usual token (its
++  // numeric value is needed, e.g. by `#if` expressions).
++  const char *q = start;
++  Token *tok = *start == '.' ? read_flonum(&q, 10) : read_num(&q);
++  if (q == p) {
++    *pp = p;
++    return tok;
++  }
++
++  // Otherwise the pp-number is only meaningful after `##`: carry its raw text,
++  // as an identifier token (that is the only kind the token-glue helper
++  // accepts, and the text is what gets pasted).
++  Token *raw = alloc_token(TK_IDENT, lexer.line, start, p);
++  raw->ident = alloc_name(start, p, true);
++  *pp = p;
++  return raw;
++}
++
+ static Token *get_token(void) {
+   static Line kEofLine = {.buf = ""};
+   static Token kEofToken = {.kind = TK_EOF, .line = &kEofLine};
+@@ -737,10 +778,10 @@
+   } else if (*p == '"') {
+     tok = read_string(&p);
+   } else if (isdigit(*p)) {
+-    tok = read_num(&p);
++    tok = for_preprocess ? read_pp_number(&p) : read_num(&p);
+ #ifndef __NO_FLONUM
+   } else if (*p == '.' && isdigit(p[1])) {
+-    tok = read_flonum(&p, 10);
++    tok = for_preprocess ? read_pp_number(&p) : read_flonum(&p, 10);
+ #endif
+   } else if ((tok = get_op_token(&p)) != NULL) {
+     // Ok.
+@@ -748,6 +789,16 @@
+     const char *begin = p;
+     const char *ident_end = read_ident(p);
+     if (ident_end != NULL) {
++      // GCC's `__extension__` is a no-op annotation (it only suppresses pedantic
++      // warnings), used as a declaration prefix, e.g.
++      //     __extension__ typedef unsigned long long ull;
++      // binutils/libiberty use it in several places.  Skip the token entirely
++      // so that the parser never sees it (xcc has no pedantic mode to suppress).
++      if (ident_end - begin == (int)sizeof("__extension__") - 1 &&
++          memcmp(begin, "__extension__", sizeof("__extension__") - 1) == 0) {
++        lexer.p = ident_end;
++        return get_token();
++      }
+       const Name *name = alloc_name(begin, ident_end, false);
+       enum TokenKind kind = reserved_word(name);
+       tok = kind != TK_EOF ? alloc_token(kind, lexer.line, begin, ident_end)
+--- a/src/cc/frontend/initializer.h
++++ b/src/cc/frontend/initializer.h
+@@ -16,6 +16,7 @@
+   IK_MULTI,   // {...}
+   IK_DOT,     // .x
+   IK_BRKT,    // [n]
++  IK_RANGE,   // [n ... m]  (GCC extension; expanded into IK_BRKT at parse time)
+ };
+ 
+ typedef struct Initializer {
+@@ -32,6 +33,11 @@
+       size_t index;
+       struct Initializer *value;
+     } bracket;
++    struct {
++      size_t index;
++      size_t index2;
++      struct Initializer *value;
++    } range;
+   };
+ } Initializer;
+ 
+--- a/src/cpp/preprocessor.c
++++ b/src/cpp/preprocessor.c
+@@ -84,8 +84,19 @@
+       break;
+     const char *q = block_comment_end(comstart + 2);
+     if (q == NULL) {
++      // A block comment that starts on a directive line but ends on a later
++      // line.  Comment removal precedes directive recognition (C99 5.1.1.2
++      // phase 3), so `# /* ...` is just a **null directive**, not an error:
++      // report "not a directive" and let the normal text path consume the
++      // comment (handle_block_comment() can read the following lines).
++      // Real case (binutils include/binary-io.h): inside a skipped `#if O_BINARY`
++      // block, a whole comment is commented out with `#` prefixes:
++      //     #  /* Avoid putting stdin/stdout in binary mode if it is ...
++      //     #     console, because ...
++      //     #     interrupt the program through Ctrl-C or Ctrl-Break.  */
++      // xcc used to abort with "block comment not closed".
+       if (hash)
+-        error("block comment not closed: %s", comstart);
++        return NULL;
+       break;
+     }
+     p = q;
+--- a/src/cc/backend/codegen_expr.c
++++ b/src/cc/backend/codegen_expr.c
+@@ -879,7 +879,32 @@
+   case TY_FIXNUM:
+   case TY_PTR:
+   case TY_FLONUM:
+-    new_ir_store(dst, 0, src);
++    {
++      // The x86 backend picks the **store width from the value register**
++      // (`ei_store` uses `ir->opr1->vsize`), so the value must already have the
++      // lvalue's size.  Small integer types are promoted to `int` while the value
++      // is computed — in particular the bitfield read-modify-write expression the
++      // frontend builds in assign_to_bitfield(), and constant folding can leave
++      // the widened value behind — and storing such a value through a narrower
++      // lvalue used to write up to 2 bytes *past* it:
++      //   binutils `struct frag` has the i386 bitfield group at its very end
++      //   (offset 142, struct size 144), so `frag->…mf_type = 0` stored 4 bytes
++      //   and zeroed `fr_literal[0..1]` — i.e. the first 2 bytes of *every*
++      //   section's data, which made the freshly built `as` emit garbage.
++      // Narrow (or widen) explicitly to the lvalue's type before storing.
++      size_t vsize = to_vsize(lhs->type);
++      if ((size_t)src->vsize != vsize) {
++        if (src->flag & VRF_CONST) {
++          if (src->flag & VRF_FLONUM)
++            src = new_const_vfreg(src->flonum.value, vsize);
++          else
++            src = new_const_vreg(src->fixnum, vsize, src->flag & VRF_MASK);
++        } else {
++          src = new_ir_cast(src, vsize, to_vflag(lhs->type))->dst;
++        }
++      }
++      new_ir_store(dst, 0, src);
++    }
+     break;
+   case TY_STRUCT:
+     if (lhs->type->struct_.info->size > 0) {

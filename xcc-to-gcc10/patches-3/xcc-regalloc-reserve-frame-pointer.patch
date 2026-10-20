@@ -1,0 +1,75 @@
+diff --git a/src/cc/arch/aarch64/ir_aarch64.c b/src/cc/arch/aarch64/ir_aarch64.c
+index 5314b64..9c4ccba 100644
+--- a/src/cc/arch/aarch64/ir_aarch64.c
++++ b/src/cc/arch/aarch64/ir_aarch64.c
+@@ -100,6 +100,8 @@ static unsigned long detect_extra_occupied(RegAlloc *ra, IR *ir) {
+ 
+ const RegAllocSettings kArchRegAllocSettings = {
+   .detect_extra_occupied = detect_extra_occupied,
++  // This backend has no dedicated frame-pointer register in the allocator.
++  .frame_pointer_index = -1,
+   .reg_param_mapping = ArchRegParamMapping,
+   .reg_return_mapping = ArchRegReturnMapping,
+   {
+diff --git a/src/cc/arch/riscv64/ir_riscv64.c b/src/cc/arch/riscv64/ir_riscv64.c
+index 3e7076b..e442a58 100644
+--- a/src/cc/arch/riscv64/ir_riscv64.c
++++ b/src/cc/arch/riscv64/ir_riscv64.c
+@@ -65,6 +65,8 @@ static unsigned long detect_extra_occupied(RegAlloc *ra, IR *ir) {
+ 
+ const RegAllocSettings kArchRegAllocSettings = {
+   .detect_extra_occupied = detect_extra_occupied,
++  // This backend has no dedicated frame-pointer register in the allocator.
++  .frame_pointer_index = -1,
+   .reg_param_mapping = ArchRegParamMapping,
+   .reg_return_mapping = ArchRegReturnMapping,
+   {
+diff --git a/src/cc/arch/x64/ir_x64.c b/src/cc/arch/x64/ir_x64.c
+index de0b891..184e607 100644
+--- a/src/cc/arch/x64/ir_x64.c
++++ b/src/cc/arch/x64/ir_x64.c
+@@ -107,6 +107,8 @@ static unsigned long detect_asm_occupied(IR *ir) {
+ const RegAllocSettings kArchRegAllocSettings = {
+   .detect_extra_occupied = detect_extra_occupied,
+   .detect_asm_occupied = detect_asm_occupied,
++  // %rbp is the frame pointer: never allocatable (see RegAllocSettings).
++  .frame_pointer_index = GET_BPREG_INDEX(),
+   .reg_param_mapping = ArchRegParamMapping,
+   .reg_return_mapping = ArchRegReturnMapping,
+   {
+diff --git a/src/cc/backend/regalloc.c b/src/cc/backend/regalloc.c
+index 2afa33a..9a427f7 100644
+--- a/src/cc/backend/regalloc.c
++++ b/src/cc/backend/regalloc.c
+@@ -594,7 +594,11 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
+     // folded into `occupied` for the *preferred* register below, which is the
+     // parameter's own ABI register.
+     unsigned long param_mask = is_flo ? 0 : live_param_mask(param_intervals, param_count, li->start);
+-    unsigned long reserved = fixed_reserved[is_flo] | param_mask;
++    // The frame pointer register is never given to a value (see RegAllocSettings).
++    unsigned long frame_pointer_mask = 0;
++    if (!is_flo && ra->settings->frame_pointer_index >= 0)
++      frame_pointer_mask = 1UL << ra->settings->frame_pointer_index;
++    unsigned long reserved = fixed_reserved[is_flo] | param_mask | frame_pointer_mask;
+     unsigned long occupied = prsp->using_bits | li->occupied_reg_bit;
+     if (ip >= 0 && !(vreg->flag & VRF_FP_GP_PARAM)) {
+       if (is_flo) {
+diff --git a/src/cc/backend/regalloc.h b/src/cc/backend/regalloc.h
+index 4498295..985cb37 100644
+--- a/src/cc/backend/regalloc.h
++++ b/src/cc/backend/regalloc.h
+@@ -30,6 +30,14 @@ typedef struct LiveInterval {
+ typedef struct RegAllocSettings {
+   unsigned long (*detect_extra_occupied)(RegAlloc *ra, IR *ir);
+   unsigned long (*detect_asm_occupied)(IR *ir);  // Registers an inline asm clobbers.
++  // Physical GP register the backend keeps as the **frame pointer**, or -1 when
++  // the backend has none.  The allocator never hands this register to a value:
++  // whether a function needs a stack frame is only final *after* allocation
++  // (running out of registers sets RAF_STACK_FRAME, and every spill slot is
++  // addressed relative to the frame pointer), so a value that already owned the
++  // register would fight the prologue's `mov %rsp, %rbp` over it and destroy the
++  // frame at run time.  See 3-problems.md Q30.
++  int frame_pointer_index;
+   const int *reg_param_mapping;
+   const int *reg_return_mapping;
+   struct {

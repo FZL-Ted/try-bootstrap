@@ -1,0 +1,31 @@
+diff --git a/src/cc/frontend/parser_expr.c b/src/cc/frontend/parser_expr.c
+index 8eb8a41..5857732 100644
+--- a/src/cc/frontend/parser_expr.c
++++ b/src/cc/frontend/parser_expr.c
+@@ -457,9 +457,23 @@ static Expr *binary(Expr *lhs, Token *tok) {
+     else
+       return new_expr_bop(kind + (EX_LOGAND - TK_LOGAND), &tyBool, tok, lhs, rhs);
+   case TK_COMMA:
+-    if (is_const(lhs))
+-      return rhs;
+-    return new_expr_bop(EX_COMMA, rhs->type, tok, lhs, rhs);
++    // A string literal used as a *value* must be turned into a character-array
++    // variable, otherwise the code generator never sees it (gen_str asserts).
++    // The right operand is the expression's value, so it is the one that
++    // matters: `(f(x), "")` — which is exactly what GCC's `gcc_assert` expands
++    // to, `((void)(!(E) ? fancy_abort(__FILE__, __LINE__, __FUNCTION__), 0 : 0))`
++    // with `__FUNCTION__` defined as the string literal "?" — reaches codegen
++    // as an EX_STR and asserts.  Convert both sides for safety (a discarded
++    // string literal on the left still has to be emitted).  `str_to_char_array_var`
++    // is idempotent for non-EX_STR operands and returns a constant unchanged
++    // (so the constant-folding shortcut below still applies).
++    {
++      Expr *r = str_to_char_array_var(curscope, rhs);
++      if (is_const(lhs))
++        return r;
++      Expr *l = str_to_char_array_var(curscope, lhs);
++      return new_expr_bop(EX_COMMA, r->type, tok, l, r);
++    }
+ 
+   default: assert(false); return NULL;  // Unreachable.
+   }

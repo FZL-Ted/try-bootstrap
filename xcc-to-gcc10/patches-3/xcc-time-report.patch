@@ -1,0 +1,392 @@
+diff --git a/src/cc/backend/codegen.c b/src/cc/backend/codegen.c
+index 756d4f8..e259b16 100644
+--- a/src/cc/backend/codegen.c
++++ b/src/cc/backend/codegen.c
+@@ -1,6 +1,23 @@
+ #include "../../config.h"
+ #include "codegen.h"
+ 
++// XCC_TIME=1 codegen sub-timers (accumulators are defined in cc1.c). Process CPU time, not wall-clock.
++#include <time.h>
++#include <stdlib.h>
++extern double cg_time_allocvars, cg_time_stmts, cg_time_frombbs, cg_time_regalloc;
++extern double cg_time_prep, cg_time_tweak, cg_time_regflow, cg_time_physalloc;
++extern double cg_time_mapvirt, cg_time_liveregs, cg_time_stackframe;
++static double cg_now(void) {
++  struct timespec ts;
++  clock_gettime((clockid_t)2 /* CLOCK_PROCESS_CPUTIME_ID */, &ts);
++  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
++}
++static int cg_timing(void) {
++  static int e = -1;
++  if (e < 0) e = getenv("XCC_TIME") != NULL;
++  return e;
++}
++
+ #include <assert.h>
+ #include <limits.h>  // CHAR_BIT
+ #include <stdbool.h>
+@@ -1397,16 +1414,22 @@ bool gen_defun(Function *func) {
+     }
+   }
+ 
+-  alloc_variable_registers(func);
++  { bool tm = cg_timing(); double t0 = tm ? cg_now() : 0;
++    alloc_variable_registers(func);
++    if (tm) cg_time_allocvars += cg_now() - t0; }
+ 
+   fnbe->ret_bb = new_bb();
+ 
+   // Statements
+-  gen_stmt(func->body_block);
++  { bool tm = cg_timing(); double t0 = tm ? cg_now() : 0;
++    gen_stmt(func->body_block);
++    if (tm) cg_time_stmts += cg_now() - t0; }
+ 
+   set_curbb(fnbe->ret_bb);
+   curbb = NULL;
+-  detect_from_bbs(fnbe->bbcon);
++  { bool tm = cg_timing(); double t0 = tm ? cg_now() : 0;
++    detect_from_bbs(fnbe->bbcon);
++    if (tm) cg_time_frombbs += cg_now() - t0; }
+ 
+   curfunc = NULL;
+   static_vars = NULL;
+@@ -1421,15 +1444,38 @@ static inline void gen_defun_after(Function *func) {
+ 
+   optimize(fnbe->ra, fnbe->bbcon);
+ 
++  bool tm = cg_timing();
++  double t0 = tm ? cg_now() : 0, t = t0;
+   prepare_register_allocation(func);
++  if (tm) { cg_time_prep += cg_now() - t; t = cg_now(); }
+   tweak_irs(fnbe);
++  if (tm) { cg_time_tweak += cg_now() - t; t = cg_now(); }
+   analyze_reg_flow(fnbe->bbcon);
++  if (tm) { cg_time_regflow += cg_now() - t; t = cg_now(); }
+ 
+   alloc_physical_registers(fnbe->ra, fnbe->bbcon);
++  if (tm) { cg_time_physalloc += cg_now() - t; t = cg_now(); }
+   map_virtual_to_physical_registers(fnbe->ra);
++  if (tm) { cg_time_mapvirt += cg_now() - t; t = cg_now(); }
+   detect_living_registers(fnbe->ra, fnbe->bbcon);
++  if (tm) { cg_time_liveregs += cg_now() - t; t = cg_now(); }
+ 
+   alloc_stack_variables_onto_stack_frame(func);
++  if (tm) { cg_time_stackframe += cg_now() - t; }
++  if (tm) {
++    double el = cg_now() - t0;
++    cg_time_regalloc += el;
++    // Name the slow functions (if the whole file is killed by a CPU limit, this is the only clue to where it was stuck).
++    if (el >= 0.10) {
++      char name[64];
++      int n = func->ident->ident->bytes;
++      if (n > (int)sizeof(name) - 1)
++        n = (int)sizeof(name) - 1;
++      memcpy(name, func->ident->ident->chars, n);
++      name[n] = '\0';
++      fprintf(stderr, "[xcc-fn] %.3f %s (regalloc cum=%.3f)\n", el, name, cg_time_regalloc);
++    }
++  }
+ 
+   curfunc = NULL;
+   curra = NULL;
+@@ -1456,10 +1502,18 @@ void gen(Vector *decls) {
+   if (decls == NULL)
+     return;
+ 
++  bool tm = cg_timing();
+   for (int i = 0, len = decls->len; i < len; ++i) {
+     Declaration *decl = decls->data[i];
+     if (decl == NULL)
+       continue;
+     gen_decl(decl);
++    // Progress: report every 100 declarations so a long compile killed by a CPU limit still shows its phase.
++    if (tm && (i % 100) == 99)
++      fprintf(stderr,
++              "[xcc-prog]   decls=%d/%d allocvars=%.2f stmts=%.2f physalloc=%.2f "
++              "regalloc=%.2f\n",
++              i + 1, len, cg_time_allocvars, cg_time_stmts, cg_time_physalloc,
++              cg_time_regalloc);
+   }
+ }
+diff --git a/src/cc/backend/optimize.c b/src/cc/backend/optimize.c
+index ea4a3a6..6db323a 100644
+--- a/src/cc/backend/optimize.c
++++ b/src/cc/backend/optimize.c
+@@ -12,6 +12,24 @@
+ #include "util.h"
+ 
+ bool keep_phi;
++
++// Per-step timing for XCC_TIME=1 (process CPU time; xcc's bundled libc has no clock())
++#include <time.h>
++#include <stdlib.h>
++double opt_time_clear, opt_time_peephole, opt_time_ssa, opt_time_unused,
++       opt_time_rmbb, opt_time_from;
++static int opt_time_enabled = -1;
++static double opt_now(void) {
++  struct timespec ts;
++  clock_gettime((clockid_t)2 /* CLOCK_PROCESS_CPUTIME_ID */, &ts);
++  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
++}
++static int opt_timing(void) {
++  if (opt_time_enabled < 0)
++    opt_time_enabled = getenv("XCC_TIME") != NULL;
++  return opt_time_enabled;
++}
++
+ bool apply_ssa;
+ 
+ static IR *is_last_jmp(BB *bb) {
+@@ -714,13 +732,17 @@ static void copy_propagation(RegAlloc *ra, BBContainer *bbcon) {
+ //
+ 
+ void optimize(RegAlloc *ra, BBContainer *bbcon) {
++  bool tm = opt_timing();
++  double t0 = tm ? opt_now() : 0;
+   clear_unused_bbs(bbcon);
++  if (tm) { opt_time_clear += opt_now() - t0; t0 = opt_now(); }
+ 
+   // Peephole
+   for (int i = 0; i < bbcon->len; ++i) {
+     BB *bb = bbcon->data[i];
+     peephole(ra, bb);
+   }
++  if (tm) { opt_time_peephole += opt_now() - t0; t0 = opt_now(); }
+ 
+   if (apply_ssa) {
+     make_ssa(ra, bbcon);
+@@ -734,9 +756,13 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
+ 
+       remove_unnecessary_bb(bbcon);
+     }
++    if (tm) { opt_time_ssa += opt_now() - t0; t0 = opt_now(); }
+   } else {
+     remove_unused_vregs(ra, bbcon);
++    if (tm) { opt_time_unused += opt_now() - t0; t0 = opt_now(); }
+     remove_unnecessary_bb(bbcon);
++    if (tm) { opt_time_rmbb += opt_now() - t0; t0 = opt_now(); }
+   }
+   detect_from_bbs(bbcon);
++  if (tm) opt_time_from += opt_now() - t0;
+ }
+diff --git a/src/cc/backend/optimize.h b/src/cc/backend/optimize.h
+index dface07..10063db 100644
+--- a/src/cc/backend/optimize.h
++++ b/src/cc/backend/optimize.h
+@@ -4,3 +4,7 @@ typedef struct Vector BBContainer;
+ typedef struct RegAlloc RegAlloc;
+ 
+ void optimize(RegAlloc *ra, BBContainer *bbcon);
++
++// XCC_TIME=1 per-step timers (printed by cc1; defined in optimize.c)
++extern double opt_time_clear, opt_time_peephole, opt_time_ssa, opt_time_unused,
++              opt_time_rmbb, opt_time_from;
+diff --git a/src/cc/backend/regalloc.c b/src/cc/backend/regalloc.c
+index 8a411c4..4b7c7cb 100644
+--- a/src/cc/backend/regalloc.c
++++ b/src/cc/backend/regalloc.c
+@@ -5,6 +5,7 @@
+ #include <limits.h>  // CHAR_BIT
+ #include <stdlib.h>  // free, qsort
+ #include <string.h>
++#include <time.h>    // XCC_TIME timing (CLOCK_PROCESS_CPUTIME_ID)
+ 
+ #include "be_aux.h"
+ #include "ir.h"
+@@ -756,6 +757,21 @@ static int insert_load_store_spilled_irs(RegAlloc *ra, BBContainer *bbcon) {
+   return inserted;
+ }
+ 
++// XCC_TIME=1: per-step timing and round count for the alloc_physical_registers() fixpoint (accumulators in cc1.c).
++// Use clock_gettime(CLOCK_PROCESS_CPUTIME_ID) instead of clock(): xcc's bundled libc has no clock().
++extern double ra_time_check, ra_time_sort, ra_time_detect, ra_time_scan, ra_time_insert;
++extern int ra_round_count, ra_round_max;
++static double ra_now(void) {
++  struct timespec ts;
++  clock_gettime((clockid_t)2 /* CLOCK_PROCESS_CPUTIME_ID */, &ts);
++  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
++}
++static int ra_timing(void) {
++  static int e = -1;
++  if (e < 0) e = getenv("XCC_TIME") != NULL;
++  return e;
++}
++
+ void alloc_physical_registers(RegAlloc *ra, BBContainer *bbcon) {
+   assert(ra->settings->regset[GPREG].phys_max < (int)(sizeof(ra->used_reg_bits[GPREG]) * CHAR_BIT));
+   assert(ra->settings->regset[FPREG].phys_max < (int)(sizeof(ra->used_reg_bits[FPREG]) * CHAR_BIT));
+@@ -764,8 +780,13 @@ void alloc_physical_registers(RegAlloc *ra, BBContainer *bbcon) {
+   LiveInterval *intervals = calloc_or_die(sizeof(LiveInterval) * vreg_count);
+   LiveInterval **sorted_intervals = calloc_or_die(sizeof(LiveInterval*) * vreg_count);
+ 
++  int rounds = 0;
+   for (;;) {
++    ++rounds;
++    bool tm = ra_timing();
++    double t = tm ? ra_now() : 0;
+     check_live_interval(bbcon, vreg_count, intervals);
++    if (tm) { ra_time_check += ra_now() - t; t = ra_now(); }
+ 
+     for (int i = 0; i < vreg_count; ++i) {
+       LiveInterval *li = &intervals[i];
+@@ -786,9 +807,12 @@ void alloc_physical_registers(RegAlloc *ra, BBContainer *bbcon) {
+       sorted_intervals[i] = &intervals[i];
+     qsort(sorted_intervals, vreg_count, sizeof(LiveInterval*), sort_live_interval);
+     ra->sorted_intervals = sorted_intervals;
++    if (tm) { ra_time_sort += ra_now() - t; t = ra_now(); }
+ 
+     detect_live_interval_flags(ra, bbcon, vreg_count, sorted_intervals);
++    if (tm) { ra_time_detect += ra_now() - t; t = ra_now(); }
+     linear_scan_register_allocation(ra, sorted_intervals, vreg_count);
++    if (tm) { ra_time_scan += ra_now() - t; t = ra_now(); }
+ 
+     // Spill vregs.
+     bool spilled = false;
+@@ -805,7 +829,9 @@ void alloc_physical_registers(RegAlloc *ra, BBContainer *bbcon) {
+     if (spilled)
+       ra->flag |= RAF_STACK_FRAME;
+ 
+-    if (insert_load_store_spilled_irs(ra, bbcon) <= 0)
++    int inserted = insert_load_store_spilled_irs(ra, bbcon);
++    if (tm) { ra_time_insert += ra_now() - t; t = ra_now(); }
++    if (inserted <= 0)
+       break;
+ 
+     if (vreg_count != ra->vregs->len) {
+@@ -819,4 +845,8 @@ void alloc_physical_registers(RegAlloc *ra, BBContainer *bbcon) {
+ 
+   ra->intervals = intervals;
+   ra->sorted_intervals = sorted_intervals;
++
++  ra_round_count += rounds;
++  if (rounds > ra_round_max)
++    ra_round_max = rounds;
+ }
+diff --git a/src/cc/cc1.c b/src/cc/cc1.c
+index 910f9ac..c7f7202 100644
+--- a/src/cc/cc1.c
++++ b/src/cc/cc1.c
+@@ -2,12 +2,14 @@
+ 
+ #include <ctype.h>
+ #include <assert.h>
++#include <time.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+ #include "codegen.h"
+ #include "emit_code.h"
++#include "optimize.h"
+ #include "fe_misc.h"
+ #include "lexer.h"
+ #include "parser.h"
+@@ -15,6 +17,30 @@
+ #include "util.h"
+ #include "var.h"
+ 
++// codegen sub-timer accumulators (extern in codegen.c; accumulated there)
++double cg_time_allocvars, cg_time_stmts, cg_time_frombbs, cg_time_regalloc;
++// Fine-grained timing for gen_defun_after() (accumulated in codegen.c): find hotspots in register allocation + frame layout
++double cg_time_prep, cg_time_tweak, cg_time_regflow, cg_time_physalloc;
++double cg_time_mapvirt, cg_time_liveregs, cg_time_stackframe;
++// Per-step timing and round count for the alloc_physical_registers() fixpoint (accumulated in regalloc.c)
++double ra_time_check, ra_time_sort, ra_time_detect, ra_time_scan, ra_time_insert;
++int ra_round_count, ra_round_max;
++
++// With XCC_TIME=1, print **process CPU time** per phase to find which pass makes a file compile very slowly.
++// Use clock_gettime(CLOCK_PROCESS_CPUTIME_ID) instead of clock(): xcc's bundled libc has **no**
++// clock() (gen2 is built with xcc's own libc; a missing declaration makes it report "cannot call except function"),
++// whereas clock_gettime is implemented in xcc/libsrc/unistd/clock_gettime.c (raw syscall).
++// Do not use wall-clock either: machine suspend makes it wildly inaccurate.
++#ifndef CLOCK_PROCESS_CPUTIME_ID
++#define CLOCK_PROCESS_CPUTIME_ID 2  /* Linux ABI; xcc's time.h defines only REALTIME */
++#endif
++static double xcc_cpu_now(void) {
++  struct timespec ts;
++  if (clock_gettime((clockid_t)CLOCK_PROCESS_CPUTIME_ID, &ts) != 0)
++    return 0.0;
++  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
++}
++
+ ////////////////////////////////////////////////
+ 
+ extern void install_builtins(Vector *decls);
+@@ -167,6 +193,9 @@ int main(int argc, char *argv[]) {
+ 
+   // Compile.
+   Vector *toplevel = new_vector();
++  bool xcc_time = getenv("XCC_TIME") != NULL;
++  double t0 = xcc_time ? xcc_cpu_now() : 0.0;
++  double t_parse = 0, t_gen = 0, t_emit = 0;
+   init_compiler(toplevel, stdout);
+ 
+   int iarg = optind;
+@@ -181,7 +210,9 @@ int main(int argc, char *argv[]) {
+     } else if (!is_file(filename) || (ifp = fopen(filename, "r")) == NULL) {
+       error("Cannot open file: %s\n", filename);
+     }
++    double ts = xcc_time ? xcc_cpu_now() : 0.0;
+     compile1(ifp, filename, toplevel);
++    if (xcc_time) t_parse += xcc_cpu_now() - ts;
+     if (ifp != stdin)
+       fclose(ifp);
+   }
+@@ -190,8 +221,53 @@ int main(int argc, char *argv[]) {
+   if (cc_flags.warn_as_error && compile_warning_count != 0)
+     exit(2);
+ 
+-  gen(toplevel);
+-  emit_code(toplevel);
++  // Progress printing: the whole file may be killed by a CPU limit, so the final XCC_TIME summary would be lost;
++  // therefore report immediately after each pass (together with codegen.c's every-100-declarations report).
++  if (xcc_time)
++    fprintf(stderr, "[xcc-prog] parse=%.3f decls=%d\n", t_parse, toplevel->len);
++
++  if (xcc_time) {
++    double ts = xcc_cpu_now();
++    gen(toplevel);
++    t_gen = xcc_cpu_now() - ts;
++    fprintf(stderr, "[xcc-prog] gen=%.3f (decls=%d)\n", t_gen, toplevel->len);
++  } else {
++    gen(toplevel);
++  }
++  if (xcc_time) {
++    double ts = xcc_cpu_now();
++    emit_code(toplevel);
++    t_emit = xcc_cpu_now() - ts;
++    fprintf(stderr, "[xcc-prog] emit=%.3f\n", t_emit);
++  } else {
++    emit_code(toplevel);
++  }
++
++  if (xcc_time) {
++    double total = xcc_cpu_now() - t0;
++    fprintf(stderr,
++            "[xcc-time] parse=%.3f gen=%.3f emit=%.3f total=%.3f (CPU seconds)\n",
++            t_parse, t_gen, t_emit, total);
++    fprintf(stderr,
++            "[xcc-time]   optimize: clear=%.3f peephole=%.3f ssa=%.3f "
++            "rm_unused=%.3f rm_bb=%.3f from_bbs=%.3f\n",
++            opt_time_clear, opt_time_peephole, opt_time_ssa,
++            opt_time_unused, opt_time_rmbb, opt_time_from);
++    fprintf(stderr,
++            "[xcc-time]   codegen: alloc_vars=%.3f stmts=%.3f from_bbs=%.3f "
++            "reg_alloc_and_frames=%.3f\n",
++            cg_time_allocvars, cg_time_stmts, cg_time_frombbs, cg_time_regalloc);
++    fprintf(stderr,
++            "[xcc-time]     defun_after: prep=%.3f tweak=%.3f regflow=%.3f "
++            "physalloc=%.3f mapvirt=%.3f liveregs=%.3f stackframe=%.3f\n",
++            cg_time_prep, cg_time_tweak, cg_time_regflow, cg_time_physalloc,
++            cg_time_mapvirt, cg_time_liveregs, cg_time_stackframe);
++    fprintf(stderr,
++            "[xcc-time]     alloc_phys: check=%.3f sort=%.3f detect=%.3f scan=%.3f "
++            "spill_insert=%.3f rounds=%d max=%d\n",
++            ra_time_check, ra_time_sort, ra_time_detect, ra_time_scan, ra_time_insert,
++            ra_round_count, ra_round_max);
++  }
+ 
+   return 0;
+ }

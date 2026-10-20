@@ -1,0 +1,12 @@
+c-testsuite/
+xcc/
+rootfs/
+gcc/
+rootfs2/
+deprecated/
+rootfs3/
+.probe/
+toybox/
+pnut/
+rootfs-pnut/
+patches-3/experimental/
