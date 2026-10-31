@@ -1,0 +1,37 @@
+diff --git a/GAS/cc_aarch64.S b/GAS/cc_aarch64.S
+index 3994ade..4d242b2 100644
+--- a/GAS/cc_aarch64.S
++++ b/GAS/cc_aarch64.S
+@@ -3591,10 +3591,12 @@ common_recursion:
+ // require_global_token function
+ // Aborts if global_token is NULL before callers dereference it
+ require_global_token:
++    push x0                     // x0 holds a live value at some call sites
+     adr x9, global_token
+     ldr x0, [x9]
+     cmp x0, 0
+     b.eq Exit_Failure
++    pop x0
+     ret
+ 
+ // require_match function
+diff --git a/cc_aarch64.M1 b/cc_aarch64.M1
+index 3ce0a91..f849b6c 100644
+--- a/cc_aarch64.M1
++++ b/cc_aarch64.M1
+@@ -5311,6 +5311,7 @@ DEFINE RBRANCH 17
+ # require_global_token function
+ # Aborts if global_token is NULL before callers dereference it
+ :require_global_token
++    PUSH_X0                             # X0 holds a live value at some call sites
+     LOAD_W9_AHEAD                       # Using global_token
+     SKIP_32_DATA
+     &global_token
+@@ -5318,6 +5319,7 @@ DEFINE RBRANCH 17
+     CMP_X0_TO_0                         # Check for EOF
+     SKIP_INST_NE                        # Abort on EOF
+     ^~Exit_Failure FBRANCH
++    POP_X0                              # X0 holds a live value at some call sites
+     RETURN
+ 
+ # require_match function
