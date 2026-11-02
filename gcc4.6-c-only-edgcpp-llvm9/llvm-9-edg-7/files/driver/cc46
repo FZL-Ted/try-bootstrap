@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# C compiler wrapper: ref-rootfs gcc-4.6.4 with flags introduced by newer GCC
+# versions filtered out (CMake adds -fdiagnostics-color when the C++ driver,
+# which ignores unknown flags, reports the flag as supported).
+HERE=$(cd "$(dirname "$0")" && pwd)
+WORK=$(dirname "$HERE")
+ROOT=${EDG_ROOT:-$(dirname "$WORK")}
+REF=${EDG_REF:-$ROOT/compiler-test/ref-rootfs-gcc4.6-c-only}
+args=()
+for a in "$@"; do
+  case "$a" in
+    -fdiagnostics-color*|-fno-diagnostics-color*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+exec "$REF/usr/gcc4.6/bin/gcc" "${args[@]}"

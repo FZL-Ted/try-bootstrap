@@ -1,0 +1,37 @@
+==> reference toolchain: /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/compiler-test/ref-rootfs-gcc4.6-c-only/usr/gcc4.6/bin/gcc (GCC 4.6.4), sysroot /home/tedm/CS/my-proj/compiler/compiler-test/ref-rootfs-gcc4.6-c-only
+==> EDG 7.0 stage-2  : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/edg7.0-stage2/edgcpfe
+==> EDG 7.0 base     : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/edg7.0-edg5.1/base
+==> LLVM sources     : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/llvm-project
+==> work directory   : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7
+==> stage 1: staging the EDG 7.0 stage-2 front end
+==> EDG 7.0: Edison Design Group C/C++ Front End, version 7.0 (Nov  2 2026 19:32:53)
+==> stage 2: building the compat layer
+==> libcompat.a: 1 objects
+==> stage 3: building libc++ 9 (33 TUs) with EDG 7.0
+==> libc++_ia64.a: 33 objects, 2806868 bytes
+==> stage 4: weakening the EDG 7.0 runtime overlap with libc++
+==> runtime/libc++ symbol overlap: 84 (weakening runtime copies)
+==> libC_ia64_weak.a: 51 objects, 181034 bytes
+==> stage 5: installing the CMake C++ driver
+==> stage 6: libc++ smoke tests
+hello 3
+stoi=42
+caught: vector
+==> smoke tests passed (vector/string, iostream + std::stoi + exceptions, multi-TU)
+==> stage 7: configuring LLVM 9 (CMake + Ninja)
+==> stage 7: building llvm-tblgen (-j 20)
+==> llvm-tblgen:   LLVM version 9.0.1
+==> stage 7: llvm-tblgen functional test (X86.td)
+==> X86.td records: 1910183 lines
+
+milestone reached: llvm-tblgen built with EDG 7.0 stage-2
+  front end       : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/edgcpfe
+  EDG base        : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/edg
+  libc++          : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/lib/libc++_ia64.a
+  EDG runtime     : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/lib/libC_ia64_weak.a
+  compat library  : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/compat/libcompat.a
+  CMake C++ driver: /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/driver/edg-cxx
+  llvm-tblgen     : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/llvm-build/bin/llvm-tblgen
+  build logs      : /home/tedm/CS/my-proj/my-bootstrap/personal-bootstrap/bootstrap-box/edgcpp-try/build/llvm-9-edg-7/log
+==> stopping here: full LLVM libraries and clang are the next stages
+EXIT=0

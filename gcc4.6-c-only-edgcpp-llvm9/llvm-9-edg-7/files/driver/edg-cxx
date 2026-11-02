@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""EDG 7.0 stage-2 (IA64 ABI) C++ driver, GCC-compatible enough for CMake/Ninja.
+
+Compile:  EDG translates .cpp -> generated C, inline functions are weakened
+          (Itanium linkonce), gcc-4.6 compiles the C with __atomic_* declared.
+Link:     gcc-4.6 (musl) links the objects against libc++_ia64 + libcompat +
+          libC_ia64_weak.
+"""
+import os, sys, subprocess, shlex, re
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+WORK = os.path.dirname(HERE)
+ROOT = os.environ.get("EDG_ROOT") or os.path.dirname(WORK)
+REF = os.environ.get("EDG_REF", ROOT + "/compiler-test/ref-rootfs-gcc4.6-c-only")
+GCC = REF + "/usr/gcc4.6/bin/gcc"
+EDG = WORK + "/edgcpfe"
+EDGDIR = WORK + "/edg"
+LIBCXX = os.environ.get("EDG_LLVM_SRC", ROOT + "/llvm-project") + "/libcxx/include"
+LLVM_ADT = os.environ.get("EDG_LLVM_SRC", ROOT + "/llvm-project") + "/llvm/include/llvm/ADT/StringExtras.h"
+GCC_INC = subprocess.check_output([GCC, "-print-file-name=include"]).decode().strip()
+ATOMIC_DECL = WORK + "/compat/atomic_decls.h"
+WEAKEN = WORK + "/compat/weaken_inline.py"
+STDLIB_DIR = WORK + "/lib"
+COMPAT_DIR = WORK + "/compat"
+LIBS = ["-L" + STDLIB_DIR, "-lc++_ia64", "-L" + COMPAT_DIR, "-lcompat",
+        "-L" + STDLIB_DIR, "-lC_ia64_weak"]
+DROPLIB = {"dl", "rt", "crypt", "util", "resolv", "nsl", "c"}
+try:
+    EDG_TIMEOUT = int(os.environ.get("EDG_TIMEOUT", "2400"))
+except ValueError:
+    EDG_TIMEOUT = 2400
+
+VALFLAGS = {"-o", "-I", "-isystem", "-iquote", "-idirafter", "-D", "-U",
+            "-include", "-imacros", "-MF", "-MT", "-MQ", "-x", "-Xlinker",
+            "-Xclang", "-Xassembler", "-L", "-l", "-B", "--param",
+            "-aux-info", "-iprefix", "-iwithprefix"}
+
+def expand(args):
+    out = []
+    for a in args:
+        if a.startswith("@"):
+            try:
+                out += expand(shlex.split(open(a[1:]).read()))
+            except OSError:
+                out.append(a)
+        else:
+            out.append(a)
+    return out
+
+def info_mode(args):
+    if "--version" in args:
+        sys.stdout.write("gcc (GCC) 4.6.4\nCopyright (C) 2011 Free Software Foundation, Inc.\n"
+                         "EDG 7.0 stage-2 C/C++ front end (Itanium ABI) driver\n")
+        return True
+    for a in args:
+        if a == "-dumpversion":
+            print("4.6.4"); return True
+        if a == "-dumpmachine":
+            print("x86_64-pc-linux-gnu"); return True
+        if a == "-print-search-dirs":
+            print("install: " + REF + "/usr/gcc4.6/lib/gcc\n"
+                  "programs: =/usr/bin\nlibraries: =" + REF + "/usr/lib")
+            return True
+        if a.startswith("-print-file-name=") or a.startswith("-print-prog-name=") \
+           or a == "-print-libgcc-file-name":
+            sys.stdout.write(subprocess.check_output([GCC, a]).decode())
+            return True
+        if a in ("-v", "-###"):
+            if len([x for x in args if not x.startswith("-")]) == 0:
+                sys.stderr.write("gcc version 4.6.4 (EDG 7.0 stage-2 front end)\n")
+                return True
+    return False
+
+args = expand(sys.argv[1:])
+if info_mode(args):
+    sys.exit(0)
+
+inc, defs, undefs, preincludes = [], [], [], []
+cxx_std = "c++14"; exceptions = True; rtti = True
+opt = "0"; pic = []
+sources, objects, linkflags = [], [], []
+mode_c = False; mode_E = False
+out = None; depfile = None; dep_target = None; lang = None
+extra_libs = []
+i = 0
+while i < len(args):
+    a = args[i]
+    nxt = args[i + 1] if i + 1 < len(args) else None
+    if a == "-c": mode_c = True
+    elif a == "-E": mode_E = True
+    elif a == "-shared": linkflags.append(a)
+    elif a == "-o": out = nxt; i += 1
+    elif a.startswith("-o") and len(a) > 2: out = a[2:]
+    elif a == "-I": inc.append(nxt); i += 1
+    elif a.startswith("-I"): inc.append(a[2:])
+    elif a in ("-isystem", "-iquote", "-idirafter"): inc.append(nxt); i += 1
+    elif a.startswith("-isystem"): inc.append(a[len("-isystem"):])
+    elif a == "-D": defs.append(nxt); i += 1
+    elif a.startswith("-D"): defs.append(a[2:])
+    elif a == "-U": undefs.append(nxt); i += 1
+    elif a.startswith("-U"): undefs.append(a[2:])
+    elif a == "-include": preincludes.append(nxt); i += 1
+    elif a.startswith("-include"): preincludes.append(a[len("-include"):])
+    elif a in ("-MF", "-MT", "-MQ"):
+        v = nxt; i += 1
+        if a == "-MF": depfile = v
+        else: dep_target = v
+    elif a.startswith("-MF"): depfile = a[3:]
+    elif a.startswith("-MT"): dep_target = a[3:]
+    elif a.startswith("-MQ"): dep_target = a[3:]
+    elif a in ("-MD", "-MMD", "-MP", "-M", "-MM"): pass
+    elif a == "-x": lang = nxt; i += 1
+    elif a.startswith("-std="):
+        s = a[5:]
+        m = re.match(r"(gnu|c)\+\+(\w+)", s)
+        if m: cxx_std = "c++" + m.group(2)
+    elif a == "-fno-exceptions": exceptions = False
+    elif a == "-fexceptions": exceptions = True
+    elif a == "-fno-rtti": rtti = False
+    elif a == "-frtti": rtti = True
+    elif a.startswith("-O"):
+        # Cap the optimisation of the *generated C*: EDG output is huge and
+        # gcc -O3 on it is pathologically slow; -O1 is plenty for stage-1.
+        lvl = a[2:] or "1"
+        opt = "0" if lvl == "0" else "1"
+    elif a in ("-fPIC", "-fpic", "-fPIE", "-fpie"): pic.append(a)
+    elif a in ("-g", "-g0", "-g1", "-g2", "-g3", "-ggdb", "-w", "-pipe", "-s",
+               "-pthread", "-Qunused-arguments", "-nostdinc++", "-rdynamic",
+               "-fno-strict-aliasing", "-fstrict-aliasing"):
+        if a == "-pthread": extra_libs.append("-lpthread")
+    elif a.startswith("-f") or a.startswith("-W") or a.startswith("-m") \
+         or a.startswith("-g") or a.startswith("-pedantic") or a.startswith("-ansi"):
+        pass
+    elif a in ("-L", "-l"):
+        v = nxt; i += 1
+        if a == "-L": linkflags.append("-L" + v)
+        elif v in DROPLIB: pass
+        else: linkflags.append("-l" + v)
+    elif a.startswith("-L"): linkflags.append(a)
+    elif a.startswith("-l"):
+        if a[2:] in DROPLIB: pass
+        else: linkflags.append(a)
+    elif a.startswith("-Wl,"): linkflags.append(a)
+    elif a in ("-static", "-nostdlib", "-nostartfiles", "-nodefaultlibs"):
+        linkflags.append(a)
+    elif a.startswith("-"):
+        pass  # unknown flag: ignore
+    else:
+        ext = os.path.splitext(a)[1]
+        if ext in (".cpp", ".cc", ".cxx", ".c++", ".C", ".CPP"):
+            sources.append(a)
+        elif ext == ".c" and lang != "c++":
+            sources.append(a)
+        elif ext in (".o", ".a", ".so", ".obj"):
+            objects.append(a)
+        else:
+            sources.append(a)
+    i += 1
+
+def edg_args(src):
+    a = [EDG, "--edg_base_dir=" + EDGDIR,
+         "--" + cxx_std, "--g++", "--gnu_version=50000", "-tused", "-w",
+         "-D__ELF__", "-D_GNU_SOURCE", "-D_LARGEFILE64_SOURCE",
+         "-D_LIBCPP_HAS_MUSL_LIBC",
+         "--sys_include=" + LIBCXX,
+         "--sys_include=" + REF + "/usr/include",
+         "--sys_include=" + GCC_INC]
+    if not exceptions: a.append("--no_exceptions")
+    if not rtti: a.append("--no_rtti")
+    for d in inc: a.append("-I" + os.path.abspath(d))
+    for d in defs: a.append("-D" + d)
+    for d in undefs: a.append("-U" + d)
+    for p in preincludes: a.append("--preinclude=" + os.path.abspath(p))
+    # EDG lookup bug (still present in 7.0): after llvm/lib/Support/Unix/Unix.h's
+    # MakeErrMsg is parsed,
+    # an unqualified lookup of llvm::detail becomes ambiguous.  Parsing
+    # StringExtras.h first avoids the broken lookup state.  Only needed (and
+    # only resolvable) for LLVM's own sources; --preinclude must come after
+    # the -I options because EDG processes options in argv order.
+    if "/llvm-project/" in os.path.abspath(src):
+        a.append("--preinclude=" + LLVM_ADT)
+    return a
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, **kw).returncode
+
+WEAK = '__attribute__((__weak__))'
+def compile_generated(gen, cmd):
+    """Compile EDG-generated C; retry after stripping weak attributes that gcc
+    rejects for internal-linkage symbols ("weak declaration ... must be
+    public").  One EDG line can mix declarations, so the weaken pass cannot
+    decide per line; gcc's diagnostic names the exact symbol."""
+    for _ in range(60):
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode == 0:
+            return True
+        err = r.stderr.decode(errors='replace')
+        syms = sorted(set(re.findall(r"weak declaration of '([^']+)' must be public", err)))
+        if not syms:
+            sys.stderr.write(err)
+            return False
+        lines = open(gen, encoding='utf-8', errors='surrogateescape').read().split('\n')
+        changed = 0
+        for i, line in enumerate(lines):
+            if WEAK not in line:
+                continue
+            hit = any(sym in line for sym in syms)
+            if not hit:
+                # EDG may put the weak attribute on the return-type line and
+                # the function name (the symbol gcc names) after a # line
+                # directive; skip those and inspect the next real line.
+                j = i + 1
+                steps = 0
+                while j < len(lines) and steps < 5:
+                    if lines[j].lstrip().startswith('#'):
+                        j += 1
+                        continue
+                    if any(sym in lines[j] for sym in syms):
+                        hit = True
+                    break
+            if hit:
+                lines[i] = line.replace(WEAK + ' ', '').replace(' ' + WEAK, '')
+                changed += 1
+        if changed == 0:
+            sys.stderr.write(err)
+            return False
+        open(gen, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(lines))
+    return False
+
+if mode_E:
+    if not sources:
+        sys.exit(0)
+    sys.exit(run(edg_args(sources[0]) + ["-E", os.path.abspath(sources[0])], cwd=EDGDIR))
+
+objs = []
+for src in sources:
+    src = os.path.abspath(src)
+    base = os.path.splitext(os.path.basename(src))[0]
+    if os.path.splitext(src)[1] == ".c":
+        obj = os.path.join(os.getcwd(), base + ".o")
+        cmd = [GCC, "-c", "-o", obj] + ["-I" + d for d in inc] + ["-D" + d for d in defs] \
+              + pic + ["-O" + opt, "-w", src]
+        if run(cmd): sys.exit(1)
+        objs.append(obj); continue
+    if mode_c and len(sources) == 1 and out:
+        obj = out
+    elif out:
+        # Link mode: keep the intermediate object (and the generated C) next
+        # to the requested output instead of polluting the current directory.
+        obj = os.path.join(os.path.dirname(os.path.abspath(out)), base + ".o")
+    else:
+        obj = os.path.join(os.getcwd(), base + ".o")
+    obj = os.path.abspath(obj)
+    gen = obj + ".edg.c"
+    a = edg_args(src) + ["--gen_c_file_name=" + gen, src]
+    try:
+        rc = subprocess.run(a, cwd=EDGDIR, timeout=EDG_TIMEOUT).returncode
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("edg: translation timed out after %ds: %s\n" % (EDG_TIMEOUT, src))
+        sys.exit(124)
+    if rc:
+        sys.stderr.write("edg: translation failed: %s\n" % src)
+        sys.exit(rc)
+    run([sys.executable, WEAKEN, gen])
+    cmd = [GCC, "-std=gnu99", "-O" + opt, "-w", "-include", ATOMIC_DECL] + pic + ["-c", gen, "-o", obj]
+    if not compile_generated(gen, cmd):
+        sys.stderr.write("edg: gcc failed on generated C for %s\n" % src)
+        sys.exit(1)
+    objs.append(obj)
+    if depfile:
+        tgt = dep_target or obj
+        with open(depfile, "w") as f:
+            f.write("%s: %s\n" % (tgt, src))
+
+if mode_c:
+    sys.exit(0)
+if not objs and not objects:
+    sys.exit(0)
+exe = out or "a.out"
+cmd = [GCC, "-o", exe] + objs + objects + linkflags + LIBS + extra_libs + ["-Wl,-z,noexecstack"]
+sys.exit(run(cmd))

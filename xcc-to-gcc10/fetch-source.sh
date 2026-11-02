@@ -3,6 +3,7 @@ exit
 
 # Tarball:
 # binutils-2.44.tar.gz
+# busybox-1.38.0.tar.bz2 (ignore)
 # gcc-4.6.4.1.tar.gz
 # gcc-10.4.0.tar.gz
 # gmp-6.2.1.tar.xz
@@ -20,8 +21,8 @@ exit
 git clone --depth 1 https://github.com/tyfkda/xcc.git
 
 # GCC 4.6.4 fork for bootstrapping, with added RISC-V support.
+# I actually use a tarball from this codeberg link. gcc-4.6.4.1.tar.gz
 git clone --depth 1 https://codeberg.org/ekaitz-zarraga/gcc.git
-# Actually use a tarball from this codeberg link. gcc-4.6.4.1.tar.gz
 
 # musl-1.2.6
 https://github.com/kraj/musl/tree/v1.2.6
