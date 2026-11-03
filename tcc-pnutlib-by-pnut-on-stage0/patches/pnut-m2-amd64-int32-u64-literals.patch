@@ -1,0 +1,64 @@
+diff --git a/pnut.c b/pnut.c
+index 2f77f83..b61b89b 100644
+--- a/pnut.c
++++ b/pnut.c
+@@ -395,6 +395,14 @@
+ #define intptr_t int
+ #endif
+ 
++// M2-Planet's int is register-sized, so it is 8 bytes when M2-Planet targets
++// amd64, while the emulated 64-bit literals are two 32-bit words that must
++// wrap at 32 bits. int32_t is exactly 32 bits with every compiler used to
++// bootstrap pnut: M2-Planet and GCC declare it, and pnut maps it to int,
++// which is 4 bytes on every target. It is defined with a macro rather than a
++// typedef because c4 does not support typedef.
++#define int32_t int
++
+ #define O_RDONLY 0
+ 
+ #ifdef PNUT_SH
+@@ -1729,10 +1737,10 @@ void include_file(char *file_name, char *relative_to) {
+ #define large_int_hi(obj) heap[obj+1]
+ 
+ // Array used to accumulate 64 bit unsigned integers on 32 bit systems
+-int *val_32;
++int32_t *val_32;
+ 
+ // x = x * y
+-void u64_mul_u32(int *x, int y) {
++void u64_mul_u32(int32_t *x, int y) {
+   int xlo = x[0] & 0xffff;
+   int xhi = I32_LOGICAL_RSHIFT_16(x[0]);
+   int ylo = y & 0xffff;
+@@ -1747,7 +1755,7 @@ void u64_mul_u32(int *x, int y) {
+ }
+ 
+ // x = x + y
+-void u64_add_u32(int *x, int y) {
++void u64_add_u32(int32_t *x, int y) {
+ #ifdef SAFE_MODE
+   if (y > 255) fatal_error("u64_add_u32: Only small integers can be added to large integers");
+ #endif
+@@ -1763,9 +1771,11 @@ void u64_add_u32(int *x, int y) {
+ }
+ 
+ // Pack a 64 bit unsigned integer into an object or immediate.
+-void u64_to_obj(int *x) {
++void u64_to_obj(int32_t *x) {
+   if (I32_POSITIVE(x[0]) && x[1] == 0) { // "small int"
+-    val = -x[0];
++    // Written as 0 - x[0] rather than -x[0] because M2-Planet parses
++    // -x[0] as (-x)[0], i.e. it negates the pointer before subscripting.
++    val = 0 - x[0];
+   } else {
+     val = alloc_obj(2);
+     large_int_lo(val) = x[0];
+@@ -4867,7 +4877,7 @@ int main(int argc, char **argv) {
+   macro_stack    = malloc(MACRO_RECURSION_MAX * sizeof(int));
+   io_buf         = malloc(1);
+ #ifdef SUPPORT_64_BIT_LITERALS
+-  val_32         = malloc(2 * sizeof(int));
++  val_32         = malloc(2 * sizeof(int32_t));
+ #endif
+ #ifdef ANNOTATE_WITH_C_CODE
+   code_char_buf  = malloc(C_CODE_BUF_LEN * sizeof(char));

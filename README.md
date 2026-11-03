@@ -21,11 +21,12 @@ onramp
 
 ## Content
 
-### tcc-pnutlib-by-pnut-on-stage0-x86
+### tcc-pnutlib-by-pnut-on-stage0
 
 Tcc (against pnut's lib) can be built through pnut on stage0-posix.
+Supports both x86 and amd64.
+`./prepare-rootfs.sh --arch {x86,amd64}`
 
-[TODO] Building tcc against musl can be done too, will be upload later.
 
 ### xcc-to-gcc10
 

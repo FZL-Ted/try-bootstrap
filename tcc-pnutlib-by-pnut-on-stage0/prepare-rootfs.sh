@@ -5,6 +5,84 @@ cd $(dirname ${BASH_SOURCE[0]})
 echo "Current working directory: " $(pwd)
 
 ############################################################
+#                    Command line options                  #
+############################################################
+
+# The stage0-posix tree spells the same architecture in more than one way, so
+# each supported architecture has these spellings:
+#   ARCH_LOWERCASE  lowercase: ./kaem.<arch>, tcc-by-pnut-on-stage0-<arch>.sh
+#   ARCH_DIR        as the stage0-posix target directory is named (AMD64, not amd64)
+#   SEED_DIR        as bootstrap-seeds/POSIX/<seed_dir> is named
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--arch <arch>]
+
+Supported architectures: x86, amd64
+
+  x86    32-bit x86 (i386 target)
+  amd64  64-bit x86-64 (x86_64 target)
+
+Options:
+  --arch <arch>  Architecture to bootstrap (default: x86).
+  --help, -h     Print this help message and exit.
+
+Each architecture selects its bootstrap script and its stage0-posix entry:
+  x86    tcc-by-pnut-on-stage0-x86.sh
+         ./stage0/bootstrap-seeds/POSIX/x86/kaem-optional-seed   ./stage0/kaem.x86
+  amd64  tcc-by-pnut-on-stage0-amd64.sh
+         ./stage0/bootstrap-seeds/POSIX/AMD64/kaem-optional-seed ./stage0/kaem.amd64
+EOF
+}
+
+TARGET_ARCH=x86
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --arch)
+      if [ $# -lt 2 ]; then
+        echo "Error: --arch requires an argument (x86 or amd64)." >&2
+        usage >&2
+        exit 1
+      fi
+      TARGET_ARCH=$2
+      shift 2
+      ;;
+    --arch=*)
+      TARGET_ARCH=${1#--arch=}
+      shift
+      ;;
+    *)
+      echo "Error: unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "$TARGET_ARCH" in
+  x86)
+    ARCH_LOWERCASE=x86
+    ARCH_DIR=x86
+    SEED_DIR=x86
+    ;;
+  amd64)
+    ARCH_LOWERCASE=amd64
+    ARCH_DIR=AMD64
+    SEED_DIR=AMD64
+    ;;
+  *)
+    echo "Error: unsupported architecture: $TARGET_ARCH (supported: x86, amd64)" >&2
+    exit 1
+    ;;
+esac
+
+echo "Target architecture: ${ARCH_LOWERCASE} (stage0-posix ${ARCH_DIR})"
+
+############################################################
 #                  Prepare stage0-posix                    #
 ############################################################
 
@@ -74,8 +152,7 @@ fi
 
 # Edit stage0-posix
 STAGE0_PATH=.
-ARCH_DIR=${ARCH_DIR:-x86}    # :- nonexist/null => value
-ARCH_LOWERCASE=${ARCH_DIR,,} # ,, all to lowercase (bash 4.0)
+# ARCH_DIR and ARCH_LOWERCASE are derived from --arch above (default: x86).
 
 REPLACE_DIR_IN_KAEM=${REPLACE_DIR_IN_KAEM:-1}
 if [ $REPLACE_DIR_IN_KAEM == "1" ] && ! grep -q "stage0" ${STAGE0_PATH}/kaem.${ARCH_LOWERCASE}; then
@@ -121,6 +198,22 @@ if [[ ! -e pnut ]]; then
   #git checkout abc34a5207b1373d0a4e3dcb3d3d6df6e22ae23d
 fi
 
+# M2-Planet's int is register-sized, so it is 8 bytes when M2-Planet targets
+# amd64, while pnut's emulated 64-bit literals (SUPPORT_64_BIT_LITERALS, enabled
+# for the x86_64 target) are two 32-bit words that must wrap at 32 bits. The
+# patch also works around M2-Planet parsing -x[i] as (-x)[i]. It only changes
+# the pnut binaries: the compilers they build are unaffected.
+cd pnut
+PATCH=../patches/pnut-m2-amd64-int32-u64-literals.patch
+if git apply --check "$PATCH" 2>/dev/null; then
+  git apply "$PATCH"
+elif ! git apply --check --reverse "$PATCH" 2>/dev/null; then
+  # Neither applies nor is already applied: a newer pnut changed the context.
+  echo "Warning: $PATCH does not apply to this pnut checkout." >&2
+  echo "         The amd64 bootstrap needs it; the x86 one does not." >&2
+fi
+cd ..
+
 
 ############################################################
 #                     Prepare rootfs                       #
@@ -128,7 +221,7 @@ fi
 
 
 rm -rf rootfs
-mkdir -p rootfs/stage0/x86
+mkdir -p rootfs/stage0/${ARCH_DIR}
 mkdir -p rootfs/pnut
 mkdir -p rootfs/{build,bin}
 
@@ -136,7 +229,7 @@ echo "=== $(pwd)"
 
 cp -r ./stage0-posix/* ./rootfs/stage0/
 
-cp tcc-by-pnut-on-stage0-x86.sh rootfs/stage0/x86/kaem.run
+cp tcc-by-pnut-on-stage0-${ARCH_LOWERCASE}.sh rootfs/stage0/${ARCH_DIR}/kaem.run
 
 cp -r ./pnut/* ./rootfs/pnut/
 
@@ -155,5 +248,5 @@ if [ $RUN_IN_BWRAP == "1" ]; then
   bwrap --bind ./rootfs / \
     --proc /proc \
     --dev /dev \
-    ./stage0/bootstrap-seeds/POSIX/x86/kaem-optional-seed ./stage0/kaem.x86
+    ./stage0/bootstrap-seeds/POSIX/${SEED_DIR}/kaem-optional-seed ./stage0/kaem.${ARCH_LOWERCASE}
 fi
