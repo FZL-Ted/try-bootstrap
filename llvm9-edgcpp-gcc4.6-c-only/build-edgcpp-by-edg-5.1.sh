@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build the latest EDG C/C++ front end (the "edgcpp-compiler" checkout, release
-# 7.0) with the EDG 5.1 front end that was itself built by the C-only GCC 4.6.4
-# toolchain in ./build/edg5.1-gcc4.6c/edg-5.1.
+# Build the latest EDG C/C++ front end (release 7.0, from the
+# edgcpp-compiler-7.0.tar.gz release tarball) with the EDG 5.1 front end that
+# was itself built by the C-only GCC 4.6.4 toolchain in
+# ./build/edg5.1-gcc4.6c/edg-5.1.
 #
 # EDG's front end emits C, not machine code: every C++ source is translated to
 # a C file by the front end and that C file is then compiled by GCC 4.6.  This
@@ -21,11 +22,13 @@
 #   build/edg5.1-gcc4.6c/edg-5.1/build/edgcpfe   EDG 5.1 front end
 #   build/edg5.1-gcc4.6c/edg-5.1/lib/libC.a      EDG 5.1 runtime library
 #   compiler-test/ref-rootfs-gcc4.6-c-only       C-only GCC 4.6.4 + musl rootfs
-#   edgcpp-compiler/                             the EDG compiler checkout
-#   predefined_macros.txt                        predefines table used by 5.1
+#   edgcpp-compiler-7.0.tar.gz                   EDG 7.0 release tarball
+#   edg-support/predefined/edg5.1/predefined_macros.txt
+#                                                predefines table used by 5.1
 #
 # Everything the build produces goes under ./build/edg7.0-edg5.1:
 #
+#   src/             the extracted EDG 7.0 source tree
 #   edgcpfe          the EDG 7.0 front end
 #   lib/libC.a       the matching EDG 7.0 runtime library
 #   base/            EDG_BASE directory for the new front end
@@ -36,10 +39,10 @@
 #
 # Overridable environment variables:
 #     REF               reference rootfs (default: compiler-test/ref-rootfs-gcc4.6-c-only)
-#     SRC               compiler checkout (default: edgcpp-compiler)
+#     TARBALL           EDG 7.0 tarball (default: edgcpp-compiler-7.0.tar.gz)
 #     EDG51             EDG 5.1 front end (default: build/edg5.1-gcc4.6c/edg-5.1/build/edgcpfe)
 #     EDG51_BASE        EDG 5.1 base directory (default: build/edg5.1-gcc4.6c/edg-5.1)
-#     PREDEF            predefined macros (default: predefined_macros.txt)
+#     PREDEF            predefined macros (default: edg-support/predefined/edg5.1/predefined_macros.txt)
 #     WORK              build directory (default: build/edg7.0-edg5.1)
 #     OPT               GCC optimization flag (default: -O2; use -O0 to speed up)
 #     EDG_TIMEOUT       per-translation timeout in seconds (default: 1800)
@@ -50,11 +53,12 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 REF=${REF:-$ROOT/compiler-test/ref-rootfs-gcc4.6-c-only}
-SRC=${SRC:-$ROOT/edgcpp-compiler}
+TARBALL=${TARBALL:-$ROOT/edgcpp-compiler-7.0.tar.gz}
 EDG51=${EDG51:-$ROOT/build/edg5.1-gcc4.6c/edg-5.1/build/edgcpfe}
 EDG51_BASE=${EDG51_BASE:-$ROOT/build/edg5.1-gcc4.6c/edg-5.1}
-PREDEF=${PREDEF:-$ROOT/predefined_macros.txt}
+PREDEF=${PREDEF:-$ROOT/edg-support/predefined/edg5.1/predefined_macros.txt}
 WORK=${WORK:-$ROOT/build/edg7.0-edg5.1}
+SRC=$WORK/src
 OPT=${OPT:--O2}
 EDG_TIMEOUT=${EDG_TIMEOUT:-1800}
 GCC_TIMEOUT=${GCC_TIMEOUT:-1800}
@@ -71,12 +75,8 @@ info() { printf '==> %s\n' "$*"; }
 
 [ -d "$REF" ]     || die "reference rootfs not found: $REF"
 [ -x "$CC" ]      || die "C compiler not found: $CC"
-[ -d "$SRC" ]     || die "compiler checkout not found: $SRC"
-[ -f "$SRC/src/cfe.c" ] || die "unexpected compiler checkout: $SRC/src/cfe.c"
-[ -f "$SRC/src/CMakeLists.txt" ] || die "missing $SRC/src/CMakeLists.txt"
-[ -d "$SRC/lib_src" ] || die "missing $SRC/lib_src"
-[ -f "$SRC/dev_tools/bin/edg-cmakedef" ] || \
-  die "missing $SRC/dev_tools/bin/edg-cmakedef"
+[ -f "$TARBALL" ] || die "release tarball not found: $TARBALL"
+[ -s "$TARBALL" ] || die "release tarball is empty: $TARBALL"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
 [ -x "$EDG51" ]   || die "EDG 5.1 front end not found: $EDG51"
 [ -d "$EDG51_BASE" ] || die "EDG 5.1 base directory not found: $EDG51_BASE"
@@ -91,7 +91,7 @@ command -v python3 >/dev/null 2>&1 || die "python3 not found"
 # input directory (or the workspace root itself).
 [ -n "$WORK" ] || die "empty build directory"
 case "$WORK" in
-  "$ROOT"|"$ROOT/build"|"$ROOT/build/edg5.1-gcc4.6c"|"$ROOT/build/edg7.0-stage2"|"$SRC"|"$REF"|"$EDG51_BASE"|"/")
+  "$ROOT"|"$ROOT/build"|"$ROOT/build/edg5.1-gcc4.6c"|"$REF"|"$EDG51_BASE"|"/")
     die "refusing to use $WORK as the build directory" ;;
 esac
 case "$WORK" in
@@ -117,34 +117,37 @@ case "$V51" in
   *) die "unexpected EDG 5.1 version output: $V51" ;;
 esac
 
-GIT_HEAD=unknown
-GIT_DESC=unknown
-GIT_STATUS_BEFORE=
-if command -v git >/dev/null 2>&1 && \
-   git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  GIT_HEAD=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || printf 'unknown')
-  GIT_DESC=$(git -C "$SRC" describe --tags --always 2>/dev/null || printf 'unknown')
-  GIT_STATUS_BEFORE=$(git -C "$SRC" status --porcelain 2>/dev/null || true)
-fi
+TARBALL_SIZE=$(stat -c %s "$TARBALL")
+TARBALL_SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
 
 info "host build with $CC"
 info "cc version: $GCC_VERSION   sysroot: $GCC_SYSROOT"
 info "EDG 5.1 front end: $EDG51 ($V51)"
-info "compiler checkout: $SRC ($GIT_DESC)"
+info "source tarball: $TARBALL ($TARBALL_SIZE bytes, sha256 $TARBALL_SHA)"
 info "build directory: $WORK"
 
 rm -rf "$WORK"
 mkdir -p "$WORK/includes" "$WORK/gen" "$WORK/obj" "$WORK/tools" \
          "$WORK/rt/gen" "$WORK/rt/obj" "$WORK/lib" "$WORK/base/lib" \
-         "$WORK/log" "$WORK/tests"
+         "$WORK/log" "$WORK/tests" "$SRC"
 touch "$WORK/.start"
-printf '%s\n' "$GIT_STATUS_BEFORE" > "$WORK/log/git-before.txt"
 START=$(date +%s)
 START_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
+# ------------------------------------------------------------ extract src ---
+
+info "extracting $TARBALL to $SRC"
+tar -xzf "$TARBALL" -C "$SRC" --strip-components=1 || \
+  die "extracting $TARBALL failed"
+[ -f "$SRC/src/cfe.c" ] || die "unexpected source tree: $SRC/src/cfe.c missing"
+[ -f "$SRC/src/CMakeLists.txt" ] || die "missing $SRC/src/CMakeLists.txt"
+[ -d "$SRC/lib_src" ] || die "missing $SRC/lib_src"
+[ -f "$SRC/dev_tools/bin/edg-cmakedef" ] || \
+  die "missing $SRC/dev_tools/bin/edg-cmakedef"
+
 # ------------------------------------------------------- configuration ---
 #
-# The checkout's build system derives its macro configuration from cmake/*.cmakedef
+# The release's build system derives its macro configuration from cmake/*.cmakedef
 # files.  edg-cmakedef is a standalone Python tool, so the same configuration
 # can be generated without running CMake.
 
@@ -229,8 +232,8 @@ timeout "$GCC_TIMEOUT" "$CC" -std=gnu99 "$OPT" -w \
 
 # ------------------------------------------------------ cpfe source list ---
 #
-# Parse the same list the checkout's CMake build uses instead of hard-coding
-# it, so a newer checkout with added or removed files is handled.
+# Parse the same list the release's CMake build uses instead of hard-coding
+# it, so a newer release with added or removed files is handled.
 
 info "extracting the cpfe source list from src/CMakeLists.txt"
 python3 - "$SRC" > "$WORK/sources.txt" <<'PY' || die "could not extract the cpfe source list"
@@ -336,7 +339,7 @@ info "edgcpfe: $V70"
 # ---------------------------------------------------- EDG 7.0 base dir ---
 #
 # The front end reads lib/predefined_macros.txt from EDG_BASE and the C++
-# headers from EDG_BASE/include.  Copy the checkout's headers so the result is
+# headers from EDG_BASE/include.  Copy the release's headers so the result is
 # self-contained.
 
 info "installing EDG_BASE for the 7.0 front end"
@@ -352,7 +355,7 @@ cp -R "$SRC/include_c99" "$WORK/base/include_c99"
 # 7.0 Linux builds default to the Itanium ABI (IA64_ABI=1), which the 5.1
 # runtime library does not implement.  Build the matching runtime with the new
 # front end.  lib_src is compiled with --c++23 --building_runtime, the same
-# mode the checkout's CMake build uses.
+# mode the release's CMake build uses.
 
 info "translating the EDG 7.0 runtime sources with the new front end"
 RT_SRC=("$SRC"/lib_src/*.c)
@@ -476,14 +479,11 @@ done
 
 # ------------------------------------------------------------ read-only ---
 #
-# The build must not write to the compiler checkout or the reference rootfs.
+# The build must not write to the release tarball or the reference rootfs.
 
-if command -v git >/dev/null 2>&1 && \
-   git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  GIT_STATUS_AFTER=$(git -C "$SRC" status --porcelain 2>/dev/null || true)
-  [ "$GIT_STATUS_AFTER" = "$GIT_STATUS_BEFORE" ] || \
-    die "the compiler checkout was modified during the build"
-fi
+TARBALL_SHA_AFTER=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+[ "$TARBALL_SHA_AFTER" = "$TARBALL_SHA" ] || \
+  die "the release tarball was modified during the build"
 REF_WRITES=$(find -L "$REF" -newer "$WORK/.start" -print -quit 2>/dev/null || true)
 [ -z "$REF_WRITES" ] || \
   die "the reference rootfs was modified during the build: $REF_WRITES"
@@ -498,7 +498,9 @@ RT_SIZE=$(stat -c %s "$WORK/lib/libC.a")
 {
   printf 'EDG 7.0 front end built with EDG 5.1\n'
   printf 'date (UTC)      : %s\n' "$START_UTC"
-  printf 'source checkout : %s (%s, %s)\n' "$SRC" "$GIT_DESC" "$GIT_HEAD"
+  printf 'source tarball  : %s\n' "$TARBALL"
+  printf 'tarball size    : %s bytes\n' "$TARBALL_SIZE"
+  printf 'tarball sha256  : %s\n' "$TARBALL_SHA"
   printf 'source files    : %s\n' "$SRC_COUNT"
   printf 'EDG 5.1         : %s\n' "$V51_FULL"
   printf 'EDG 7.0         : %s\n' "$V70_FULL"

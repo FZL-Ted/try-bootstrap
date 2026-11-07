@@ -2,7 +2,9 @@
 
 ## Introduction
 
-This is a project focus on different paths to bootstrap many things from source.
+This is a project focus on trying different paths to bootstrap many things from source.
+It is not intended to be used, at least for now.
+
 
 Some relevant projects are listed as follows:
 
@@ -42,6 +44,7 @@ gcc-4.6.4.1 stage2 => gcc-10.4.0
 gcc-4.6 (disable C++ support) (or host gcc) + musl => edgcpp-5.1 => edgcpp-7.0 => 
 llvm-3.5 => llvm-9.0
 
+It is possible to go to llvm-3.5 from a gcc-4.6 (diable C++).
 
 ## Acknownledgement
 

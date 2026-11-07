@@ -9,8 +9,9 @@
 # Sources come from a release tarball, not from a git checkout.  Two input
 # files must already exist next to this script:
 #
-#     edg-compiler-5.1.tar.gz    release tarball (GitHub archive of tag 5.1)
-#     predefined_macros.txt      EDG predefined-macro table (from edg origin/main)
+#     edgcpp-compiler-5.1.tar.gz  release tarball (GitHub archive of tag 5.1)
+#     edg-support/predefined/edg5.1/predefined_macros.txt
+#                                 EDG predefined-macro table (from edg origin/main)
 #
 # This builds two products under ./build/edg5.1-gcc4.6c/:
 #
@@ -35,15 +36,15 @@
 #
 # Overridable environment variables:
 #     REF       reference rootfs   (default: compiler-test/ref-rootfs-gcc4.6-c-only)
-#     TARBALL   release tarball    (default: edg-compiler-5.1.tar.gz)
-#     PREDEF    predefined macros  (default: predefined_macros.txt)
+#     TARBALL   release tarball    (default: edgcpp-compiler-5.1.tar.gz)
+#     PREDEF    predefined macros  (default: edg-support/predefined/edg5.1/predefined_macros.txt)
 #
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 REF=${REF:-$ROOT/compiler-test/ref-rootfs-gcc4.6-c-only}
-TARBALL=${TARBALL:-$ROOT/edg-compiler-5.1.tar.gz}
-PREDEF=${PREDEF:-$ROOT/predefined_macros.txt}
+TARBALL=${TARBALL:-$ROOT/edgcpp-compiler-5.1.tar.gz}
+PREDEF=${PREDEF:-$ROOT/edg-support/predefined/edg5.1/predefined_macros.txt}
 BUILD=$ROOT/build/edg5.1-gcc4.6c
 TREE=$BUILD/edg-5.1
 LOG=$BUILD/build.log
