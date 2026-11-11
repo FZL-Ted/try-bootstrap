@@ -1,0 +1,5 @@
+        /* array definition */
+        next();
+        if (tok == TOK_RESTRICT1)
+            next();
+        n = -1;

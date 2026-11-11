@@ -1,0 +1,17 @@
+        /* array definition */
+        next();
+        while (1) {
+            switch (tok) {
+            case TOK_RESTRICT1: case TOK_RESTRICT2: case TOK_RESTRICT3:
+            case TOK_CONST1:
+            case TOK_VOLATILE1:
+            case TOK_STATIC:
+            case '*':
+                next();
+                continue;
+            default:
+                break;
+            }
+            break;
+        }
+        n = -1;

@@ -1,0 +1,4 @@
+                    (sym->st_info == 0x10
+                    || sym->st_info == 0x11
+                    || sym->st_info == 0x12
+                    )) {
