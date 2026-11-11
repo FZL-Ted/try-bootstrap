@@ -1,0 +1,4 @@
+void __va_start(__va_list_struct *ap, void *fp)
+{
+    memset(ap, 0, sizeof(__va_list_struct));
+    *ap = *(__va_list_struct *)((char *)fp - 16);

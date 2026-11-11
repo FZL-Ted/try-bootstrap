@@ -384,4 +384,4 @@ ${BUILD}/bintools sha256sum build/tcc-boot0 build/tcc-boot1 build/tcc-boot2 buil
 
 echo "This is the end of the script."
 
-./tcc-musl.sh
+./tcc-musl-x86.sh

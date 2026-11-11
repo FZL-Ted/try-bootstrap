@@ -1,0 +1,5 @@
+                    istrlen = strlen(strtab + sym->st_name)+1;
+                    if (strpos + istrlen > anamesmax) {
+                        anamesmax = (strpos + istrlen) * 2;
+                        anames = tcc_realloc(anames, anamesmax);
+                    }

@@ -1,0 +1,7 @@
+void __va_start(__va_list_struct *ap, void *fp)
+{
+    __va_list_struct *src = (__va_list_struct *)((char *)fp - 16);
+    ap->gp_offset = src->gp_offset;
+    ap->fp_offset = src->fp_offset;
+    ap->overflow_offset = src->overflow_offset;
+    ap->reg_save_area = src->reg_save_area;

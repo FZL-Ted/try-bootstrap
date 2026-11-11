@@ -15,15 +15,21 @@ echo "Current working directory: " $(pwd)
 #   SEED_DIR        as bootstrap-seeds/POSIX/<seed_dir> is named
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [--arch <arch>]
+Usage: $(basename "$0") [--arch <arch>] [--rootfs <dir>]
 
 Supported architectures: x86, amd64
 
   x86    32-bit x86 (i386 target)
   amd64  64-bit x86-64 (x86_64 target)
 
+Both also build musl and a tcc linked against it (tcc-musl-x86.sh and
+tcc-musl-amd64.sh, run at the end of the bootstrap script).
+
 Options:
   --arch <arch>  Architecture to bootstrap (default: x86).
+  --rootfs <dir> Name of the rootfs directory to create.  It must start
+                 with "rootfs" (the script deletes it first).  Default:
+                 rootfs-x86 for x86, rootfs-amd64 for amd64.
   --help, -h     Print this help message and exit.
 
 Each architecture selects its bootstrap script and its stage0-posix entry:
@@ -35,6 +41,7 @@ EOF
 }
 
 TARGET_ARCH=x86
+ROOTFS_DIR=
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,6 +60,19 @@ while [ $# -gt 0 ]; do
       ;;
     --arch=*)
       TARGET_ARCH=${1#--arch=}
+      shift
+      ;;
+    --rootfs)
+      if [ $# -lt 2 ]; then
+        echo "Error: --rootfs requires an argument." >&2
+        usage >&2
+        exit 1
+      fi
+      ROOTFS_DIR=$2
+      shift 2
+      ;;
+    --rootfs=*)
+      ROOTFS_DIR=${1#--rootfs=}
       shift
       ;;
     *)
@@ -80,7 +100,34 @@ case "$TARGET_ARCH" in
     ;;
 esac
 
+if [ -z "$ROOTFS_DIR" ]; then
+  case "$TARGET_ARCH" in
+    x86)   ROOTFS_DIR=rootfs-x86 ;;
+    amd64) ROOTFS_DIR=rootfs-amd64 ;;
+  esac
+fi
+
+# The script removes the rootfs directory before populating it.  Only accept
+# a plain name starting with "rootfs" so that a typo cannot delete the source
+# checkouts (pnut/, stage0-posix/, ...) or an absolute path.
+case "$ROOTFS_DIR" in
+  rootfs|rootfs-*) ;;
+  *)
+    echo "Error: --rootfs must be a plain directory name starting with 'rootfs'." >&2
+    echo "       Got: ${ROOTFS_DIR}" >&2
+    exit 1
+    ;;
+esac
+case "$ROOTFS_DIR" in
+  */*)
+    echo "Error: --rootfs must not contain a path separator." >&2
+    echo "       Got: ${ROOTFS_DIR}" >&2
+    exit 1
+    ;;
+esac
+
 echo "Target architecture: ${ARCH_LOWERCASE} (stage0-posix ${ARCH_DIR})"
+echo "Rootfs directory: ${ROOTFS_DIR}"
 
 ############################################################
 #                  Prepare stage0-posix                    #
@@ -220,66 +267,74 @@ cd ..
 ############################################################
 
 
-rm -rf rootfs
-mkdir -p rootfs/stage0/${ARCH_DIR}
-mkdir -p rootfs/pnut
-mkdir -p rootfs/{build,bin}
+rm -rf "${ROOTFS_DIR}"
+mkdir -p "${ROOTFS_DIR}/stage0/${ARCH_DIR}"
+mkdir -p "${ROOTFS_DIR}/pnut"
+mkdir -p "${ROOTFS_DIR}"/{build,bin}
 
 echo "=== $(pwd)"
 
-cp -r ./stage0-posix/* ./rootfs/stage0/
+cp -r ./stage0-posix/* "./${ROOTFS_DIR}/stage0/"
 
-cp tcc-by-pnut-on-stage0-${ARCH_LOWERCASE}.sh rootfs/stage0/${ARCH_DIR}/kaem.run
+cp tcc-by-pnut-on-stage0-${ARCH_LOWERCASE}.sh "${ROOTFS_DIR}/stage0/${ARCH_DIR}/kaem.run"
 
-cp -r ./pnut/* ./rootfs/pnut/
+cp -r ./pnut/* "./${ROOTFS_DIR}/pnut/"
 
 # pnut's bintools sources live in kit/bintools/ and are flattened into
 # kit/bintools.c by pnut's own utils/process-includes.sh now.
-( cd pnut && ./utils/process-includes.sh kit/bintools/bintools-base.c ) > rootfs/pnut/kit/bintools.c
+( cd pnut && ./utils/process-includes.sh kit/bintools/bintools-base.c ) > "${ROOTFS_DIR}/pnut/kit/bintools.c"
 
 
 ############################################################
 #                   Prepare musl/tcc-musl                  #
 ############################################################
 
-# Only the x86 chain builds musl and a tcc linked against it yet.
-if [ "$TARGET_ARCH" = x86 ]; then
+# Both the x86 and the amd64 chain build musl and a tcc linked against it.
+if [ "$TARGET_ARCH" = x86 ] || [ "$TARGET_ARCH" = amd64 ]; then
   if [ ! -e musl-1.2.5.tar.gz ]; then
     wget -O musl-1.2.5.tar.gz https://github.com/kraj/musl/archive/refs/tags/musl-1.2.5.tar.gz
   fi
-  if [ ! -e ./rootfs/musl-1.2.5 ]; then
-    tar xzf musl-1.2.5.tar.gz -C ./rootfs/ || exit 3
+  if [ ! -e "./${ROOTFS_DIR}/musl-1.2.5" ]; then
+    tar xzf musl-1.2.5.tar.gz -C "./${ROOTFS_DIR}/" || exit 3
   fi
-  python3 ./prepare-musl.py || exit 4
-
-  # The boot tccs are linked with pnut/kit/libtcc1.c as their runtime library.
-  # pnut's version provides deliberately incomplete 64 bit helpers (__lshrdi3
-  # returns its argument, __divdi3 truncates to 32 bits), and tcc uses those
-  # helpers while constant folding *and* while building its assembler tables -
-  # a tcc bootstrapped with them silently miscompiles every constant shift and
-  # division and the whole 0x0f opcode map.  Replace it with a complete one.
-  cp tcc-libgcc.c rootfs/pnut/kit/libtcc1.c
+  python3 ./prepare-musl.py --arch ${TARGET_ARCH} \
+    --root "${ROOTFS_DIR}/musl-1.2.5" || exit 4
 
   # The driver that turns the generated source list into compiler runs (kaem
   # has no loops and cannot pass a thousand arguments) and the complete tcc
   # runtime library it links against tcc-musl.
-  mkdir -p rootfs/musl-1.2.5/tcc-bootstrap
-  cp tcc-libgcc.c rootfs/musl-1.2.5/tcc-bootstrap/tcc_libgcc.c
-  cp tcbuild.c rootfs/musl-1.2.5/tcc-bootstrap/tcbuild.c
+  mkdir -p "${ROOTFS_DIR}/musl-1.2.5/tcc-bootstrap"
+  cp tcbuild.c "${ROOTFS_DIR}/musl-1.2.5/tcc-bootstrap/tcbuild.c"
 
-  # Three tcc source patches, applied by tcc-by-pnut-on-stage0-x86.sh through
-  # bintools simple-patch (see the patch section there):
+  if [ "$TARGET_ARCH" = x86 ]; then
+    # The boot tccs are linked with pnut/kit/libtcc1.c as their runtime library.
+    # pnut's version provides deliberately incomplete 64 bit helpers (__lshrdi3
+    # returns its argument, __divdi3 truncates to 32 bits), and tcc uses those
+    # helpers while constant folding *and* while building its assembler tables -
+    # a tcc bootstrapped with them silently miscompiles every constant shift and
+    # division and the whole 0x0f opcode map.  Replace it with a complete one.
+    cp tcc-libgcc.c "${ROOTFS_DIR}/pnut/kit/libtcc1.c"
+    cp tcc-libgcc.c "${ROOTFS_DIR}/musl-1.2.5/tcc-bootstrap/tcc_libgcc.c"
+    TCC_MUSL_SCRIPT=tcc-musl-x86.sh
+  else
+    # On x86_64 the 64 bit helpers are native; tcc-musl uses pnut's
+    # libtcc1.c plus lib/va_list.c, exactly like the boot chain.
+    TCC_MUSL_SCRIPT=tcc-musl-amd64.sh
+  fi
+  cp "${TCC_MUSL_SCRIPT}" "${ROOTFS_DIR}/${TCC_MUSL_SCRIPT}"
+
+  # Three tcc source patches, applied by the tcc-by-pnut-on-stage0-*.sh
+  # scripts through bintools simple-patch (see the patch section there):
   #   ar_weak_symbols : let tcc's ar index STB_WEAK symbols - musl's public API
   #                     is almost entirely weak aliases
   #   array_static    : accept const/volatile/restrict/static/* inside []
   #   static_link     : link statically by default (only libc.a exists)
-  mkdir -p rootfs/pnut/kit/tcc-patches/0.9.27
-  cp tcc-boot-patches/* rootfs/pnut/kit/tcc-patches/0.9.27/
+  mkdir -p "${ROOTFS_DIR}/pnut/kit/tcc-patches/0.9.27"
+  cp tcc-boot-patches/* "${ROOTFS_DIR}/pnut/kit/tcc-patches/0.9.27/"
 
-  # tcc-musl.sh is run by tcc-by-pnut-on-stage0-x86.sh (its last line).
-  # Its shebang makes kaem run it, so it must be executable.
-  cp tcc-musl.sh rootfs/tcc-musl.sh
-  chmod +x rootfs/tcc-musl.sh
+  # The build script runs this file as its last line.  Its shebang makes kaem
+  # run it, so it must be executable.
+  chmod +x "${ROOTFS_DIR}/${TCC_MUSL_SCRIPT}"
 fi
 
 
@@ -290,7 +345,7 @@ fi
 
 RUN_IN_BWRAP=1
 if [ $RUN_IN_BWRAP == "1" ]; then
-  bwrap --bind ./rootfs / \
+  bwrap --bind "./${ROOTFS_DIR}" / \
     --proc /proc \
     --dev /dev \
     ./stage0/bootstrap-seeds/POSIX/${SEED_DIR}/kaem-optional-seed ./stage0/kaem.${ARCH_LOWERCASE}

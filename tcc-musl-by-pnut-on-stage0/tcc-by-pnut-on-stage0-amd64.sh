@@ -46,8 +46,10 @@ PNUT=./pnut
 echo "############### Building pnut ###############"
 
 # For (AMD64, x86) * (STG-v1, STG-v2) => tcc-boot3 37afc
-# This amd64 script reaches the same kind of fixed point, with
-# tcc-boot2 = tcc-boot3 = b6bc9b3d0c0635476dac371d1864fd219e7b6ae2455ad7910dc620033c0707a3
+# With the extra musl tcc patches (weak ar symbols, array declarators, static
+# link, the ar symbol-name growth fix and the self-contained va_list object)
+# this amd64 script still reaches a fixed point, now with
+# tcc-boot2 = tcc-boot3 = 7ddfe1336e6bb7caa494fc97fc36afceeabcd8e2ab877c307a92d02a2b162782
 
 # Use M2-Planet to build pnut-exe-by-M2-Planet
 # On amd64, M2-Planet's int is 8 bytes, while pnut's integer overflow check
@@ -174,6 +176,29 @@ cd ${BUILD}
 ./bintools simple-patch ${TCC_DIR}/tccelf.c ../${PATCHES_DIR}/x86_64_static_plt_call.before ../${PATCHES_DIR}/x86_64_static_plt_call.after
 # [tccelf.c] static x86-64 GOT relocations
 ./bintools simple-patch ${TCC_DIR}/tccelf.c ../${PATCHES_DIR}/x86_64_static_got_reloc.before ../${PATCHES_DIR}/x86_64_static_got_reloc.after
+# [tcctools.c] index STB_WEAK symbols too.  musl's public API is almost all weak
+# aliases; without this, tcc's ar leaves them out of the archive symbol index
+# and the linker cannot resolve e.g. malloc() or printf().
+./bintools simple-patch ${TCC_DIR}/tcctools.c ../${PATCHES_DIR}/ar_weak_symbols.before ../${PATCHES_DIR}/ar_weak_symbols.after
+# [tcctools.c] grow the ar symbol-name buffer geometrically.  The boot libc's
+# malloc/realloc never frees, so tcc ar's old one-symbol-at-a-time realloc
+# leaks O(symbols^2) and overflows the 25 MB heap on a full x86_64 musl.
+./bintools simple-patch ${TCC_DIR}/tcctools.c ../${PATCHES_DIR}/ar_anames_decl.before ../${PATCHES_DIR}/ar_anames_decl.after
+./bintools simple-patch ${TCC_DIR}/tcctools.c ../${PATCHES_DIR}/ar_anames_grow.before ../${PATCHES_DIR}/ar_anames_grow.after
+# [tccgen.c] accept const/volatile/restrict/static/* inside [] (C99 array
+# declarators, which musl's network code uses in prototypes).
+./bintools simple-patch ${TCC_DIR}/tccgen.c ../${PATCHES_DIR}/array_static.before ../${PATCHES_DIR}/array_static.after
+# [libtcc.c] link statically by default: the bootstrap only ever has a static
+# musl (libc.a), so a dynamic default would produce binaries that cannot run.
+./bintools simple-patch ${TCC_DIR}/libtcc.c ../${PATCHES_DIR}/static_link.before ../${PATCHES_DIR}/static_link.after
+# [lib/va_list.c] keep the x86_64 va_list object free of libc references.
+# The boot libc's tcc_add_runtime() adds libc.a before libtcc1.a and does not
+# rescan it, so an abort()/memset()/memmove() from libtcc1.a stays undefined
+# when tcc-musl links a program.  The memset is redundant (whole struct is
+# copied right after), the struct copy is written out field by field (tcc
+# would turn it into a memmove call) and abort() becomes a trap.
+./bintools simple-patch ${TCC_DIR}/lib/va_list.c ../${PATCHES_DIR}/va_list_no_libc.before ../${PATCHES_DIR}/va_list_no_libc.after
+./bintools simple-patch ${TCC_DIR}/lib/va_list.c ../${PATCHES_DIR}/va_list_no_abort.before ../${PATCHES_DIR}/va_list_no_abort.after
 
 
 
@@ -404,3 +429,5 @@ ${CC} \
 ${BUILD}/bintools sha256sum build/tcc-boot0 build/tcc-boot1 build/tcc-boot2 build/tcc-boot3
 
 echo "This is the end of the script."
+
+./tcc-musl-amd64.sh

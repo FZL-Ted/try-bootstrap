@@ -1,0 +1,2 @@
+                    istrlen = strlen(strtab + sym->st_name)+1;
+                    anames = tcc_realloc(anames, strpos+istrlen);

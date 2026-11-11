@@ -1,0 +1,3 @@
+    int symtabsize = 0;//, strtabsize = 0;
+    int anamesmax = 0;
+    char *anames = NULL;

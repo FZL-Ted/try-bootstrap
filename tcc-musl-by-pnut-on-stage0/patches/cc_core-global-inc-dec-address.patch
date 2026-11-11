@@ -1,27 +1,20 @@
 diff --git a/cc_core.c b/cc_core.c
-index 724f9df..a088013 100644
+index ef9011a..2b5e4e2 100644
 --- a/cc_core.c
 +++ b/cc_core.c
-@@ -907,13 +907,19 @@ void primary_expr_variable(void)
- 		return;
- 	}
- 
--	int is_prefix_operator = (match("++", global_token->prev->prev->s) || match("--", global_token->prev->prev->s)) && (options != TLO_STATIC && options != TLO_GLOBAL);
--	int is_postfix_operator = (match("++", global_token->s) || match("--", global_token->s)) && (options != TLO_STATIC && options != TLO_GLOBAL);
-+	int is_prefix_operator = (match("++", global_token->prev->prev->s) || match("--", global_token->prev->prev->s));
-+	int is_postfix_operator = (match("++", global_token->s) || match("--", global_token->s));
+@@ -913,13 +913,13 @@ void primary_expr_variable(void)
+ 	 * subscript follows: `++p[i]` indexes through p's value, so p is loaded
+ 	 * as for any subscript. `++*p` names the cell p points at, so it takes
+ 	 * the store path's loads, which leave that cell's address. */
+-	int is_prefix_operand = is_prefix_operator && !match("[", global_token->s);
++	int is_prefix_operand = is_prefix_operator && !match("[", global_token->s) && !match("->", global_token->s);
+ 	int is_postfix_operator = (match("++", global_token->s) || match("--", global_token->s)) && (options != TLO_STATIC && options != TLO_GLOBAL);
  	int is_indexed_local_array = match("[", global_token->s) && (options & TLO_LOCAL_ARRAY);
  	int is_local_array = (options & TLO_LOCAL_ARRAY) != 0;
  	int is_function = options & TLO_FUNCTION;
  
--	if(is_prefix_operator || is_postfix_operator || is_indexed_local_array || is_function)
-+	/* `++var`/`var++` need the address of the variable, not its value, so keep
-+	 * the address loaded above.  Global/static variables live in a single
-+	 * memory cell as well, so their address is what the inc/dec code expects.
-+	 * A following `[` or `->` is left to the postfix code, which needs the
-+	 * loaded base pointer instead (arrays are accessed via a pointer cell). */
-+	int postfix_follows = (global_token->s[0] == '[') || (global_token->s[0] == '-' && global_token->s[1] == '>');
-+	if((is_prefix_operator || is_postfix_operator) && !postfix_follows)
+-	if((is_prefix_operand && 0 == num_dereference && options != TLO_STATIC && options != TLO_GLOBAL) || is_postfix_operator || is_indexed_local_array || is_function)
++	if((is_prefix_operand && 0 == num_dereference) || is_postfix_operator || is_indexed_local_array || is_function)
  	{
  		return;
  	}
