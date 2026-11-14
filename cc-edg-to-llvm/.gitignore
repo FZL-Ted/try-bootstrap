@@ -1,0 +1,5 @@
+rootfs-hostgcc/
+rootfs-hostclang/
+llvm-project-5.0/
+*.log
+*.ti
