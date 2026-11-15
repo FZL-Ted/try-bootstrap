@@ -41,7 +41,21 @@ xcc-musl => gmp-6.2.1/mpfr-4.1.0/mpc-1.2.1/zlib-1.3.2 =>
 gcc-4.6.4.1 (ekaitz-zarraga fork) stage1 => musl-gcc =>
 gcc-4.6.4.1 stage2 => gcc-10.4.0
 
-### [WIP] gcc4.6-c-only-edgcpp-llvm9
+### cc-edg-to-llvm: From host gcc/clang (w/o C++) to llvm5.
+
+This directory builds a compiler toolchain in which the host C compiler is used
+**only as a C compiler**, the C++ front end is **EDG 7.0** (which translates
+C++ to C), and the C library is **musl**, built from source here.  The final
+goal is LLVM/clang 5.0.2 and a self-hosted rebuild of clang.
+
+host gcc/clang + host binutils => musl
+host gcc/clang + host binutils + musl => edg5.1 => edg7.0
+host gcc/clang + host binutils + musl + edg7.0 => llvm5 (~7 hours w/ 19 cores)
+host binutils + musl + llvm5 => llvm5 (bootstrap)
+
+Note: Both host gcc and host clang in my PC can run through the process, but it takes time (perhaps 7 hours).
+
+### gcc4.6-c-only-edgcpp-llvm9
 
 gcc-4.6 (disable C++ support) (or host gcc) + musl => edgcpp-5.1 => edgcpp-7.0 => 
 llvm-3.5 => llvm-9.0
