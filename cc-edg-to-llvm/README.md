@@ -96,20 +96,34 @@ ROOTFS=rootfs-hostgcc   ./try-clang-refhost-llvm5.x.sh
 script for host clang, since it adds the clang-specific link setup
 (`--gcc-toolchain`, non-PIE, compiler-rt atomics, host `libatomic`).
 
-### Stage 3b layout note
+Then self-host that clang.  Stage 3b accepts the `try-clang-*` trees directly,
+so no symlinks or copies are needed:
 
-`refhost-llvm-5.x-bootstrap.sh` expects the baseline stage-3a layout:
+```bash
+ROOTFS=rootfs-hostgcc \
+STAGE1_PREFIX=/opt/llvm5-clang-try \
+STAGE1_BUILD=build/llvm5-clang-try \
+BUILD_DIR=build/llvm5-clang-bootstrap \
+PREFIX=/opt/llvm5-clang-bootstrap \
+  ./refhost-llvm-5.x-bootstrap.sh
+```
+
+### Stage 3b directory selection
+
+`refhost-llvm-5.x-bootstrap.sh` defaults to the baseline stage-3a layout:
 
 ```text
 <rootfs>/build/llvm5/src                   source tree
 <rootfs>/opt/llvm5/bin/clang               stage-1 clang
 ```
 
-When stage 3a was built by a `try-*` script, the trees are under
-`build/llvm5-try` / `build/llvm5-clang-try` and the prefixes are
-`/opt/llvm5-try` / `/opt/llvm5-clang-try`.  Either create the baseline paths
-(e.g. symlinks) or pass `STAGE1_PREFIX=/opt/llvm5-clang-try` and make
-`build/llvm5/src` point at the actual source tree.
+To bootstrap a stage 3a built by a `try-*` script, or any other directory
+layout, point the script at that tree instead of creating symlinks.  The
+directories are selected with `STAGE1_PREFIX`, `STAGE1_BUILD`, `SRC_DIR`,
+`BUILD_DIR` and `PREFIX` (see [Environment variables](#environment-variables));
+all of them are interpreted inside the rootfs and a leading `/` is optional.
+`ROOTFS` selects the rootfs as before, so the same script works on another
+rootfs that contains a stage-3a toolchain.
 
 ## Environment variables
 
@@ -124,7 +138,11 @@ When stage 3a was built by a `try-*` script, the trees are under
 | `SKIP_CONFIGURE` | `refhost-llvm5.x.sh` | unset | Skip the cmake configure step |
 | `USE_PRELINK` | try scripts | `0` | `2` = experimental EDG automatic instantiation + parallel pre-link driver; measured to converge slowly, off by default |
 | `LLVM_TARGET` | LLVM stages | `clang` | CMake target to build |
-| `STAGE1_PREFIX` | stage 3b | `/opt/llvm5` | Stage-1 install prefix |
+| `STAGE1_PREFIX` | stage 3b | `/opt/llvm5` | Stage-1 install prefix (inside the rootfs) |
+| `STAGE1_BUILD` | stage 3b | `build/llvm5` | Stage-1 build tree; its `src/` is the source tree by default |
+| `SRC_DIR` | stage 3b | `$STAGE1_BUILD/src` | LLVM source tree override |
+| `BUILD_DIR` | stage 3b | `build/llvm5-bootstrap` | Stage-3b build tree |
+| `PREFIX` | LLVM stages | per script (`/opt/llvm5`, `/opt/llvm5-try`, `/opt/llvm5-clang-try`, or `/opt/llvm5-bootstrap`) | Install prefix inside the rootfs |
 
 ## Artifacts (default `rootfs-hostgcc`)
 
@@ -140,13 +158,15 @@ rootfs-hostgcc/
     crt/libclang_rt.builtins-x86_64.a
     build/stage1/                 LLVM/clang build tree
     log/                          per-stage logs
-  opt/llvm5/bin/clang{,++}        stage-3a result (static, no GLIBC symbols)
-  opt/llvm5-bootstrap/bin/clang   stage-3b self-hosted result
+  opt/llvm5/bin/clang{,++}             stage-3a result (static, no GLIBC symbols)
+  opt/llvm5-bootstrap/bin/clang        stage-3b self-hosted result (gcc-built stage 1)
+  opt/llvm5-clang-bootstrap/bin/clang  stage-3b result (clang-built stage 1)
 ```
 
 The `try-*` scripts use `build/llvm5-try`, `build/llvm5-clang-try` and
 `/opt/llvm5-try`, `/opt/llvm5-clang-try` instead, so they do not overwrite the
-baseline artifacts.
+baseline artifacts.  The corresponding stage-3b run uses
+`build/llvm5-clang-bootstrap` and `/opt/llvm5-clang-bootstrap`.
 
 ## Timing (20-core machine, `JOBS=19`, `-O0`)
 
@@ -158,7 +178,7 @@ baseline artifacts.
 | three prerequisite scripts together | **6–10 min** |
 | stage 3a, `refhost-llvm5.x.sh` (incl. libc++, builtins, LLVM/clang) | **7–9 h** from a clean rootfs |
 | stage 3a, `try-gcc-*` / `try-clang-*` (big-TU-first) | **~6.4 h** (measured 6.38 h / 6.40 h; with libc++/builtins reused; add ~6–8 min if they are rebuilt) |
-| stage 3b, `refhost-llvm-5.x-bootstrap.sh` | **~19 min** (measured 1139 s) |
+| stage 3b, `refhost-llvm-5.x-bootstrap.sh` | **~19 min** (measured 1139 s from the gcc-built stage 1, 1115 s from the clang-built one) |
 
 The bottleneck is EDG translating the large `clang/lib/{Sema,AST,CodeGen}`
 TUs, not the C compiler: the host-gcc and host-clang stage-3a runs took almost

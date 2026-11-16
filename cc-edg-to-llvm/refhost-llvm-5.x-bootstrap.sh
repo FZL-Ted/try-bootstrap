@@ -26,9 +26,27 @@
 #     <rootfs>/opt/llvm5-bootstrap/                     self-hosted LLVM + clang
 #     <rootfs>/build/llvm5-bootstrap/build-info.txt
 #
+# Directory selection (all paths are inside the rootfs; a leading "/" is
+# optional, so "build/llvm5" and "/build/llvm5" mean the same thing):
+#     ROOTFS          rootfs containing the whole chain   (default rootfs-hostgcc)
+#     STAGE1_PREFIX   stage-3a install prefix             (default /opt/llvm5)
+#     STAGE1_BUILD    stage-3a build tree                 (default build/llvm5)
+#     SRC_DIR         LLVM 5.0.2 source tree              (default $STAGE1_BUILD/src)
+#     BUILD_DIR       this stage's build tree             (default build/llvm5-bootstrap)
+#     PREFIX          this stage's install prefix         (default /opt/llvm5-bootstrap)
+# The stage-1 libc++/libC/dso_handle/compiler-rt installed in /usr by stage 3a
+# are taken from the rootfs as usual.
+#
 # Usage:
 #     ./refhost-llvm-5.x-bootstrap.sh
 #     JOBS=8 ./refhost-llvm-5.x-bootstrap.sh
+#
+#     # bootstrap the host-clang stage-3a product built by try-clang-*.sh
+#     STAGE1_PREFIX=/opt/llvm5-clang-try \
+#     STAGE1_BUILD=build/llvm5-clang-try \
+#     BUILD_DIR=build/llvm5-clang-bootstrap \
+#     PREFIX=/opt/llvm5-clang-bootstrap \
+#       ./refhost-llvm-5.x-bootstrap.sh
 #
 set -euo pipefail
 
@@ -51,10 +69,35 @@ esac
 
 JOBS=${JOBS:-$(nproc --ignore=1 2>/dev/null || nproc 2>/dev/null || echo 1)}
 [ "$JOBS" -ge 1 ] 2>/dev/null || JOBS=1
-STAGE1_PREFIX=${STAGE1_PREFIX:-/opt/llvm5}
-PREFIX=${PREFIX:-/opt/llvm5-bootstrap}
-BUILD=$ROOTFS/build/llvm5-bootstrap
-SRC=$ROOTFS/build/llvm5/src
+
+# Normalise a directory name to a path inside the rootfs.  Accepts both
+# "build/foo" and "/build/foo", and also a host path that already starts with
+# the resolved rootfs (so ROOTFS=... STAGE1_BUILD=$PWD/rootfs-x/build/foo works).
+in_rootfs() {
+  local p=$1
+  case "$p" in
+    "$ROOTFS"|"$ROOTFS"/*) p=${p#"$ROOTFS"} ;;
+  esac
+  case "$p" in
+    "") p=/ ;;
+    /*) ;;
+    *) p=/$p ;;
+  esac
+  # no trailing slash except for /
+  case "$p" in
+    /) ;;
+    */) p=${p%/} ;;
+  esac
+  printf '%s' "$p"
+}
+
+STAGE1_PREFIX=$(in_rootfs "${STAGE1_PREFIX:-/opt/llvm5}")
+PREFIX=$(in_rootfs "${PREFIX:-/opt/llvm5-bootstrap}")
+STAGE1_BUILD=$(in_rootfs "${STAGE1_BUILD:-build/llvm5}")
+SRC_IN=$(in_rootfs "${SRC_DIR:-$STAGE1_BUILD/src}")
+BUILD_IN=$(in_rootfs "${BUILD_DIR:-build/llvm5-bootstrap}")
+BUILD=$ROOTFS$BUILD_IN
+SRC=$ROOTFS$SRC_IN
 LOG=$BUILD/log
 
 command -v bwrap >/dev/null 2>&1 || die "bwrap (bubblewrap) not found"
@@ -78,8 +121,12 @@ case "$CLANG_VER" in
 esac
 
 info "stage-1 clang : $CLANG_VER"
+info "rootfs        : $ROOTFS"
 info "stage-1 prefix: $ROOTFS$STAGE1_PREFIX"
+info "stage-1 build : $ROOTFS$STAGE1_BUILD"
+info "source tree   : $SRC"
 info "bootstrap to  : $ROOTFS$PREFIX"
+info "build tree    : $BUILD"
 info "jobs          : $JOBS"
 
 START=$(date +%s)
@@ -117,8 +164,8 @@ set -euo pipefail
 info() { printf '==> %s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-BUILD=/build/llvm5-bootstrap
-SRC=/build/llvm5/src
+BUILD=@BUILD_IN@
+SRC=@SRC_IN@
 STAGE1_PREFIX=@STAGE1_PREFIX@
 PREFIX=@PREFIX@
 JOBS=@JOBS@
@@ -296,6 +343,8 @@ done
 INNER_EOF
 
 sed -i \
+  -e "s|@BUILD_IN@|$BUILD_IN|g" \
+  -e "s|@SRC_IN@|$SRC_IN|g" \
   -e "s|@STAGE1_PREFIX@|$STAGE1_PREFIX|g" \
   -e "s|@PREFIX@|$PREFIX|g" \
   -e "s|@JOBS@|$JOBS|g" \
@@ -370,8 +419,8 @@ LEAKS=$("$BWRAP" "${BWRAP_ARGS[@]}" --chdir / -- /bin/sh -c \
 [ -z "$LEAKS" ] || die "sandbox exposes host compiler paths: $LEAKS"
 
 info "starting bubblewrap sandbox (no host compiler)"
-"$BWRAP" "${BWRAP_ARGS[@]}" --chdir /build/llvm5-bootstrap -- \
-  /bin/bash /build/llvm5-bootstrap/tools/inner-build.sh
+"$BWRAP" "${BWRAP_ARGS[@]}" --chdir "$BUILD_IN" -- \
+  /bin/bash "$BUILD_IN/tools/inner-build.sh"
 
 # bubblewrap creates empty mount-point files in the backing rootfs for every
 # --ro-bind destination that did not exist; drop those stubs.
