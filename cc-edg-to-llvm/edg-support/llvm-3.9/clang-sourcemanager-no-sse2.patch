@@ -1,0 +1,20 @@
+--- a/clang/lib/Basic/SourceManager.cpp
++++ b/clang/lib/Basic/SourceManager.cpp
+@@ -1189,7 +1189,7 @@
+   return PLoc.getColumn();
+ }
+ 
+-#ifdef __SSE2__
++#if defined(__SSE2__) && !defined(EDG_BOOTSTRAP_NO_SSE2)
+ #include <emmintrin.h>
+ #endif
+ 
+@@ -1219,7 +1219,7 @@
+     // Skip over the contents of the line.
+     const unsigned char *NextBuf = (const unsigned char *)Buf;
+ 
+-#ifdef __SSE2__
++#if defined(__SSE2__) && !defined(EDG_BOOTSTRAP_NO_SSE2)
+     // Try to skip to the next newline using SSE instructions. This is very
+     // performance sensitive for programs with lots of diagnostics and in -E
+     // mode.

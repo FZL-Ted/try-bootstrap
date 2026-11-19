@@ -1,0 +1,20 @@
+--- a/clang/lib/Lex/Lexer.cpp
++++ b/clang/lib/Lex/Lexer.cpp
+@@ -2265,7 +2265,7 @@
+   return true;
+ }
+ 
+-#ifdef __SSE2__
++#if defined(__SSE2__) && !defined(EDG_BOOTSTRAP_NO_SSE2)
+ #include <emmintrin.h>
+ #elif __ALTIVEC__
+ #include <altivec.h>
+@@ -2328,7 +2328,7 @@
+ 
+       if (C == '/') goto FoundSlash;
+ 
+-#ifdef __SSE2__
++#if defined(__SSE2__) && !defined(EDG_BOOTSTRAP_NO_SSE2)
+       __m128i Slashes = _mm_set1_epi8('/');
+       while (CurPtr+16 <= BufferEnd) {
+         int cmp = _mm_movemask_epi8(_mm_cmpeq_epi8(*(const __m128i*)CurPtr,

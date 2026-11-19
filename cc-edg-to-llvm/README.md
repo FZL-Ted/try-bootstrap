@@ -1,244 +1,202 @@
-# edgcpp-try: LLVM/clang 5 self-hosting with host gcc/clang + musl + EDG
+# edgcpp-try: LLVM/clang 3.9 bootstrap with host gcc/clang + musl + EDG
 
 This directory builds a compiler toolchain in which the host C compiler is used
-**only as a C compiler**, the C++ front end is **EDG 7.0** (which translates
-C++ to C), and the C library is **musl**, built from source here.  The final
-goal is LLVM/clang 5.0.2 and a self-hosted rebuild of clang.
+**only as a C compiler**, the C++ front end is **EDG 7.0** (it translates C++
+to C), and the C library is **musl**, built from source here.
 
-Rules used throughout:
+**LLVM/clang 3.9 is the first-round LLVM target of this tree.**  The current
+scripts are the three 3.9 stages plus the common musl/EDG prerequisites:
+
+1. `refhost-musl.sh` — musl 1.2.6 with the host C compiler.
+2. `refhost-edg5.1.sh` — EDG 5.1.
+3. `refhost-edg7.0.sh` — EDG 7.0, built with EDG 5.1.
+4. `refhost-llvm3.9.x-1.sh` — stage 1: LLVM/clang 3.9 libraries + clang,
+   libc++ 3.9 and compiler-rt builtins, with host gcc or clang as the C-only
+   compiler and EDG for every C++ translation unit.
+5. `refhost-llvm3.9.x-2.sh` — stage 2: lld 3.9 and LLVM binutils
+   (`llvm-ar`, `llvm-ranlib`, `llvm-nm`, `llvm-readobj`) built by the stage-1
+   clang, with host binutils allowed for this stage only.
+6. `refhost-llvm3.9.x-bootstrap.sh` — stage 3: self-hosted clang 3.9 + lld 3.9,
+   built by the stage-1 clang + lld in a sandbox with **no host compiler and no
+   host binutils**.
+
+## Rules
 
 - Host `gcc` or `clang` is never asked to compile C++: no `g++`, no `clang++`
-  in C++ mode, no `-x c++`.  Every C++ translation unit goes through EDG,
-  which emits C.
-- All builds happen inside a `rootfs-*` directory.  LLVM stages run in a
-  bubblewrap sandbox with an explicit read-only whitelist of host binaries
-  (`--ro-bind /usr/bin/ld /usr/bin/ld`, etc.).
-- The C library and the produced binaries are musl-based and static; no host
+  in C++ mode, no `-x c++`.  All C++ goes through EDG, which emits C.
+- All builds happen under a `rootfs-*` directory inside this directory.
+- LLVM stages run in bubblewrap with an explicit read-only host whitelist.
+- The resulting C library and binaries are musl-based and static; no host
   glibc headers or libraries are used for the result.
-- The bootstrap stage (stage 3b) runs in a sandbox with **no host compiler**;
-  only host binutils and build tools are visible.
-- No git operations are used; input tarballs are looked up next to the scripts
-  or one level up.
+- The stage-3 sandbox exposes no host compiler and no host binutils.
 
-## Contents
+## Input tarballs
 
-| Path | Description |
-|---|---|
-| `refhost-musl.sh` | Stage 0: build musl 1.2.6 with the host C compiler; create the rootfs and `bin/cc` wrapper |
-| `refhost-edg5.1.sh` | Stage 1: build EDG 5.1 with host C compiler + musl (the 5.1 front end is plain C) |
-| `refhost-edg7.0.sh` | Stage 2: build EDG 7.0 using EDG 5.1 + musl (the 7.0 front end is C++, translated by 5.1) |
-| `refhost-llvm5.x.sh` | Stage 3a (baseline): build LLVM/clang 5.0.2 with host gcc (C-only) + EDG 7.0 + musl |
-| `refhost-llvm-5.x-bootstrap.sh` | Stage 3b: rebuild LLVM/clang 5.0.2 with the stage-3a clang, in a sandbox without any host compiler |
-| `try-gcc-refhost-llvm5.x.sh` | Experimental stage 3a: same as above plus **big-TU-first scheduling**; separate tree `build/llvm5-try`, prefix `/opt/llvm5-try` |
-| `try-clang-refhost-llvm5.x.sh` | Experimental stage 3a using **host clang** as the C compiler; accepts `ROOTFS=rootfs-hostgcc` or `rootfs-hostclang`; separate tree `build/llvm5-clang-try`, prefix `/opt/llvm5-clang-try` |
-| `edg-support/predefined/edg5.1/predefined_macros.txt` | EDG 5.1 predefined macro table (the release tarball does not ship `lib/`) |
-| `rootfs-hostgcc/` | Rootfs produced by the host-gcc chain (musl, EDG, LLVM artifacts) |
-| `rootfs-hostclang/` | Rootfs produced by the host-clang chain (same refhost scripts with `HOSTCC=clang`) |
-| `llvm5-*.log`, `try-*.log`, `*-start.ts` | Build logs and timing records from earlier runs |
-
-Input tarballs (place in this directory or one level up):
+Place these next to the scripts, one level up, or in the reference tree:
 
 ```text
 musl-v1.2.6.tar.gz
 edgcpp-compiler-5.1.tar.gz
 edgcpp-compiler-7.0.tar.gz
-llvm-project-5.x.tar.gz          # LLVM 5.0.2 monorepo (clang, libcxx, compiler-rt)
+llvm-project-3.9.x.tar.gz
 ```
 
-## Quick start
+## Host gcc: complete command sequence
 
-### Option A: host gcc
-
-Build the prerequisite chain once:
+Run from this directory.  A clean host-gcc chain creates `rootfs-gcc`:
 
 ```bash
-./refhost-musl.sh                 # -> rootfs-hostgcc
-./refhost-edg5.1.sh
-./refhost-edg7.0.sh
+HOSTCC=gcc ROOTFS=rootfs-gcc ./refhost-musl.sh
+HOSTCC=gcc ROOTFS=rootfs-gcc ./refhost-edg5.1.sh
+HOSTCC=gcc ROOTFS=rootfs-gcc ./refhost-edg7.0.sh
+HOSTCC=gcc ROOTFS=rootfs-gcc ./refhost-llvm3.9.x-1.sh
+HOSTCC=gcc ROOTFS=rootfs-gcc ./refhost-llvm3.9.x-2.sh
+HOSTCC=gcc ROOTFS=rootfs-gcc ./refhost-llvm3.9.x-bootstrap.sh
 ```
 
-Then build LLVM/clang.  **Both scripts can be used with host gcc**:
+Results:
+
+- stage-1/stage-2 prefix: `rootfs-gcc/opt/llvm3.9`
+- self-hosted prefix: `rootfs-gcc/opt/llvm3.9-bootstrap`
+
+## Host clang: complete command sequence
+
+A clean host-clang chain creates `rootfs-clang`:
 
 ```bash
-# baseline (no reordering)
-./refhost-llvm5.x.sh              # -> rootfs-hostgcc/opt/llvm5
-
-# experimental, big-TU-first scheduling
-./try-gcc-refhost-llvm5.x.sh      # -> rootfs-hostgcc/opt/llvm5-try
+HOSTCC=clang ROOTFS=rootfs-clang ./refhost-musl.sh
+HOSTCC=clang ROOTFS=rootfs-clang ./refhost-edg5.1.sh
+HOSTCC=clang ROOTFS=rootfs-clang ./refhost-edg7.0.sh
+HOSTCC=clang ROOTFS=rootfs-clang ./refhost-llvm3.9.x-1.sh
+HOSTCC=clang ROOTFS=rootfs-clang ./refhost-llvm3.9.x-2.sh
+HOSTCC=clang ROOTFS=rootfs-clang ./refhost-llvm3.9.x-bootstrap.sh
 ```
 
-Finally, the self-hosted rebuild:
+Results:
 
-```bash
-./refhost-llvm-5.x-bootstrap.sh   # -> rootfs-hostgcc/opt/llvm5-bootstrap
-```
+- stage-1/stage-2 prefix: `rootfs-clang/opt/llvm3.9`
+- self-hosted prefix: `rootfs-clang/opt/llvm3.9-bootstrap`
 
-### Option B: host clang
+In host-clang mode:
 
-Build the prerequisite chain into a clang-based rootfs:
+- host clang compiles every C file, including EDG-generated `.int.c`;
+- links use host clang as the driver plus host `ld.lld`, with explicit musl
+  `crt1/crti/crtn`, libc/libm/libpthread, stage-1 libc++/libC and compiler-rt
+  builtins (`-nostdlib`, `-nodefaultlibs`, `-nostartfiles`, `-nostdlib++`);
+- **no host gcc is invoked for compilation or linking**;
+- EDG-generated C atomics with `volatile void *` are adapted by
+  [`edg-support/llvm-3.9/edg-clang-atomic.h`](edg-support/llvm-3.9/edg-clang-atomic.h).
 
-```bash
-HOSTCC=clang ROOTFS=rootfs-hostclang ./refhost-musl.sh
-HOSTCC=clang ROOTFS=rootfs-hostclang ./refhost-edg5.1.sh
-HOSTCC=clang ROOTFS=rootfs-hostclang ./refhost-edg7.0.sh
-```
+## Output layout
 
-Build LLVM/clang with host clang as the C-only compiler (the rootfs may be
-either the gcc-built or the clang-built one):
+| Item | Host gcc | Host clang |
+|---|---|---|
+| rootfs | `rootfs-gcc/` | `rootfs-clang/` |
+| stage-1 build | `rootfs-gcc/build/llvm3.9` | `rootfs-clang/build/llvm3.9` |
+| stage-2 build | `rootfs-gcc/build/llvm3.9-tools` | `rootfs-clang/build/llvm3.9-tools` |
+| stage-3 build | `rootfs-gcc/build/llvm3.9-bootstrap` | `rootfs-clang/build/llvm3.9-bootstrap` |
+| stage-1/2 prefix | `rootfs-gcc/opt/llvm3.9` | `rootfs-clang/opt/llvm3.9` |
+| stage-3 prefix | `rootfs-gcc/opt/llvm3.9-bootstrap` | `rootfs-clang/opt/llvm3.9-bootstrap` |
 
-```bash
-ROOTFS=rootfs-hostclang ./try-clang-refhost-llvm5.x.sh
-# or
-ROOTFS=rootfs-hostgcc   ./try-clang-refhost-llvm5.x.sh
-```
-
-`refhost-llvm5.x.sh` itself is the gcc wrapper path; use the `try-clang-*`
-script for host clang, since it adds the clang-specific link setup
-(`--gcc-toolchain`, non-PIE, compiler-rt atomics, host `libatomic`).
-
-Then self-host that clang.  Stage 3b accepts the `try-clang-*` trees directly,
-so no symlinks or copies are needed:
-
-```bash
-ROOTFS=rootfs-hostgcc \
-STAGE1_PREFIX=/opt/llvm5-clang-try \
-STAGE1_BUILD=build/llvm5-clang-try \
-BUILD_DIR=build/llvm5-clang-bootstrap \
-PREFIX=/opt/llvm5-clang-bootstrap \
-  ./refhost-llvm-5.x-bootstrap.sh
-```
-
-### Stage 3b directory selection
-
-`refhost-llvm-5.x-bootstrap.sh` defaults to the baseline stage-3a layout:
+Stage 2 installs `lld`/`ld.lld` and the LLVM binutils replacements into the
+stage-1 prefix.  Stage 3 installs the self-hosted clang and lld into its own
+prefix and reports:
 
 ```text
-<rootfs>/build/llvm5/src                   source tree
-<rootfs>/opt/llvm5/bin/clang               stage-1 clang
+host tools : no host compiler and no host binutils in the sandbox
 ```
 
-To bootstrap a stage 3a built by a `try-*` script, or any other directory
-layout, point the script at that tree instead of creating symlinks.  The
-directories are selected with `STAGE1_PREFIX`, `STAGE1_BUILD`, `SRC_DIR`,
-`BUILD_DIR` and `PREFIX` (see [Environment variables](#environment-variables));
-all of them are interpreted inside the rootfs and a leading `/` is optional.
-`ROOTFS` selects the rootfs as before, so the same script works on another
-rootfs that contains a stage-3a toolchain.
+## Deprecated LLVM targets
+
+The old LLVM 3.5 and LLVM 5 build scripts are archived under:
+
+```text
+ref-deprecated/llvm3.5.x/
+ref-deprecated/llvm5.x/
+```
+
+They are kept for history only and are **not** part of the current chain.  Do
+not mix their scripts, rootfs names, or build trees with the 3.9 scripts.  See
+the `Why-not-*.md` files in those directories for the reasons they were
+replaced.
+
+## Build times (16 jobs)
+
+Measured on the local 20-core machine:
+
+| Step | gcc chain | clang chain |
+|---|---|---|
+| `refhost-llvm3.9.x-1.sh` | 11904 s | 11527 s |
+| `refhost-llvm3.9.x-2.sh` | 755 s | 687 s |
+| `refhost-llvm3.9.x-bootstrap.sh` | 924 s | 843 s |
+
+The prerequisite musl/EDG5.1/EDG7.0 steps together take only a few minutes.
+
+## Source patches and EDG compatibility
+
+All source patches are under [`edg-support/llvm-3.9/`](edg-support/llvm-3.9)
+and are applied idempotently by:
+
+```bash
+edg-support/llvm-3.9/apply.sh <source-root>
+```
+
+The patches cover:
+
+- musl differences in libc++ 3.9 (`strtoll_l`, `max_align_t`, `strerror_r`);
+- musl's `FILE *const` stdio declarations in LLVM;
+- CMake 4 compatibility (`CMP0051 NEW`);
+- the two Clang 3.9 SSE2 fast paths (`Lexer.cpp`, `SourceManager.cpp`).
+
+For EDG translation, `EDG_BOOTSTRAP_NO_SSE2` selects the existing scalar
+fallbacks in those two files, so no `emmintrin.h` or GCC intrinsic header is
+needed.  The normal stage-3 clang build does not define this macro and keeps
+the SSE2 path.
+
+LLVM 3.9's lld already handles `R_X86_64_GOTPCRELX`/`REX_GOTPCRELX` and TLS;
+no lld source patch is required.
+
+## Important stage-3 details
+
+- `-fuse-init-array` is used when compiling and linking the self-hosted
+  clang/lld and libc++ 3.9.  The stage-1 clang emits `.ctors` for some 3.9
+  LLVM/Clang objects; lld 3.9 does not map `.ctors` into `.init_array`, so
+  without this flag constructors (including `cl::opt` registration) would not
+  run in the self-hosted binaries.
+- Stage 3 uses the stage-1 `llvm-tblgen`/`clang-tblgen` as the native tablegen
+  generators (`-DLLVM_TABLEGEN`, `-DCLANG_TABLEGEN`).  The generated clang is
+  still compiled and linked by the stage-1 clang + lld; table generation does
+  not depend on a self-hosted tablegen binary.
 
 ## Environment variables
 
 | Variable | Scripts | Default | Meaning |
 |---|---|---|---|
-| `ROOTFS` | all | `rootfs-hostgcc` | Rootfs directory, resolved against the current directory and required to be inside the script directory |
-| `HOSTCC` | musl/EDG/LLVM stages | `gcc` (`clang` in `try-clang-*`) | Host C compiler |
-| `JOBS` | all | `nproc --ignore=1` (19 here) | Parallel jobs; the build deliberately does not use every core |
-| `OPT` | LLVM stages | `-O0` | Optimization for EDG-generated C; `-O0` is much faster for this workload |
-| `KEEP_SRC` | LLVM stages | unset | Reuse an already extracted source tree |
-| `REUSE_BUILD` | `refhost-llvm5.x.sh` | unset | Reuse the existing CMake build tree |
-| `SKIP_CONFIGURE` | `refhost-llvm5.x.sh` | unset | Skip the cmake configure step |
-| `USE_PRELINK` | try scripts | `0` | `2` = experimental EDG automatic instantiation + parallel pre-link driver; measured to converge slowly, off by default |
-| `LLVM_TARGET` | LLVM stages | `clang` | CMake target to build |
-| `STAGE1_PREFIX` | stage 3b | `/opt/llvm5` | Stage-1 install prefix (inside the rootfs) |
-| `STAGE1_BUILD` | stage 3b | `build/llvm5` | Stage-1 build tree; its `src/` is the source tree by default |
-| `SRC_DIR` | stage 3b | `$STAGE1_BUILD/src` | LLVM source tree override |
-| `BUILD_DIR` | stage 3b | `build/llvm5-bootstrap` | Stage-3b build tree |
-| `PREFIX` | LLVM stages | per script (`/opt/llvm5`, `/opt/llvm5-try`, `/opt/llvm5-clang-try`, or `/opt/llvm5-bootstrap`) | Install prefix inside the rootfs |
+| `ROOTFS` | all | `rootfs-hostgcc` | Rootfs directory inside this directory; use `rootfs-gcc`/`rootfs-clang` as above |
+| `HOSTCC` | musl/EDG/stage-1 | `gcc` | Host C compiler (`gcc` or `clang`) |
+| `JOBS` | all | `16` | Parallel jobs |
+| `OPT` | stage 1 | `-O0` | Optimization for EDG-generated C |
+| `KEEP_SRC` | LLVM stages | unset | Reuse an extracted source tree |
+| `REUSE_BUILD` | LLVM stages | unset | Reuse an existing CMake build tree |
+| `SKIP_CONFIGURE` | LLVM stages | unset | Skip CMake configure |
+| `CONFIGURE_ONLY` | stage 1 | unset | Stop after successful CMake configure |
+| `REBUILD_LIBCXX` | stage 1 | unset | Force a libc++ rebuild |
+| `REBUILD_CRT` | stage 1 | unset | Force a compiler-rt builtins rebuild |
+| `LLVM_TARGET` | stage 1 | `clang` | CMake target to build |
+| `STAGE1_PREFIX` | stage 3 | `/opt/llvm3.9` | Stage-1 prefix inside the rootfs |
+| `STAGE1_BUILD` | stage 3 | `build/llvm3.9` | Stage-1 build tree |
+| `SRC_DIR` | stage 3 | `$STAGE1_BUILD/src` | LLVM source tree override |
+| `BUILD_DIR` | stage 3 | `build/llvm3.9-bootstrap` | Stage-3 build tree |
+| `PREFIX` | stage 3 | `/opt/llvm3.9-bootstrap` | Stage-3 install prefix |
 
-## Artifacts (default `rootfs-hostgcc`)
+## Verified regression status
 
-```text
-rootfs-hostgcc/
-  bin/cc                          musl + C-only compiler wrapper
-  usr/include, usr/lib            musl headers and static libraries
-  build/edg5.1/edg-5.1/build/edgcpfe
-  build/edg7.0/edgcpfe, base/     EDG 7.0 front end and base directory
-  build/llvm5/
-    src/                          LLVM 5.0.2 source (patched for CMake 4 and musl)
-    libcxx/libc++.a               libc++ built through EDG -> C -> musl gcc
-    crt/libclang_rt.builtins-x86_64.a
-    build/stage1/                 LLVM/clang build tree
-    log/                          per-stage logs
-  opt/llvm5/bin/clang{,++}             stage-3a result (static, no GLIBC symbols)
-  opt/llvm5-bootstrap/bin/clang        stage-3b self-hosted result (gcc-built stage 1)
-  opt/llvm5-clang-bootstrap/bin/clang  stage-3b result (clang-built stage 1)
-```
+Both complete chains were built from clean rootfs directories and passed all
+stage checks:
 
-The `try-*` scripts use `build/llvm5-try`, `build/llvm5-clang-try` and
-`/opt/llvm5-try`, `/opt/llvm5-clang-try` instead, so they do not overwrite the
-baseline artifacts.  The corresponding stage-3b run uses
-`build/llvm5-clang-bootstrap` and `/opt/llvm5-clang-bootstrap`.
+- host gcc: stage-1 11904 s, stage-2 755 s, stage-3 924 s;
+- host clang: stage-1 11527 s, stage-2 687 s, stage-3 843 s.
 
-## Timing (20-core machine, `JOBS=19`, `-O0`)
-
-| Step | Approximate time |
-|---|---|
-| `refhost-musl.sh` | 1–2 min |
-| `refhost-edg5.1.sh` | 1–2 min |
-| `refhost-edg7.0.sh` | 4–5 min (measured ~259 s) |
-| three prerequisite scripts together | **6–10 min** |
-| stage 3a, `refhost-llvm5.x.sh` (incl. libc++, builtins, LLVM/clang) | **7–9 h** from a clean rootfs |
-| stage 3a, `try-gcc-*` / `try-clang-*` (big-TU-first) | **~6.4 h** (measured 6.38 h / 6.40 h; with libc++/builtins reused; add ~6–8 min if they are rebuilt) |
-| stage 3b, `refhost-llvm-5.x-bootstrap.sh` | **~19 min** (measured 1139 s from the gcc-built stage 1, 1115 s from the clang-built one) |
-
-The bottleneck is EDG translating the large `clang/lib/{Sema,AST,CodeGen}`
-TUs, not the C compiler: the host-gcc and host-clang stage-3a runs took almost
-the same time (22963 s vs 23034 s).
-
-## Optimizations that were tried/kept
-
-Adopted in the `try-*` scripts (and usable via the baseline scripts where
-noted):
-
-- **Build only the `clang` target.**  No LLVM tools, lld, libclang, examples,
-  tests, or loadable modules (`LLVMHello.so`); the install is done by hand
-  (clang, `clang++`, resource headers, libc++, compiler-rt builtins, EDG
-  `libC.a`).  `LLVM_INCLUDE_TOOLS` must stay ON because the clang project is
-  added from `llvm/tools/CMakeLists.txt`.
-- **Big-TU-first scheduling** (`try-gcc-*`, `try-clang-*`): after configure,
-  the object prerequisite lists in all generated `build.make` files are sorted
-  by source-file size (74 files changed), so the biggest translation units
-  start earlier.  This reduces the per-library tail; cross-library ordering is
-  still dependency-driven.  Measured total time about 6.4 h.
-- **`OPT=-O0`** by default, plus `-fno-asynchronous-unwind-tables`,
-  `-fno-unwind-tables`, `-fno-pie` and `-no-pie` on the generated C and links.
-- **Only the clang target is installed**, not LLVM headers/CMake files/tools;
-  this avoids the long `install` target and the `LLVMHello.so` failure on a
-  static-only musl rootfs.
-- **Host clang support** (`try-clang-*`): binds `/usr/lib/llvm-22`, derives
-  `--gcc-toolchain` from `crtbegin.o`, links non-PIE against musl, and solves
-  EDG's `__atomic_add_fetch_*` references with a clang-built compiler-rt
-  `atomic.o` plus host `libatomic.a`.
-- **Cache/reuse knobs**: `KEEP_SRC`, `REUSE_BUILD`, `SKIP_CONFIGURE`,
-  `REBUILD_LIBCXX`, `REBUILD_CRT` allow resuming rather than restarting.
-
-Explored but **not adopted by default**:
-
-- **EDG automatic instantiation + parallel prelink driver**
-  (`USE_PRELINK=2`).  `edg_prelink -n` assigns roughly one TU per pass, so
-  convergence needs O(number of TUs) sequential passes; the parallel recompile
-  never materializes.  The machinery is implemented and left behind the flag,
-  default `0`.
-- Direct per-object `make` targets for scheduling (invalid in CMake's generated
-  Makefiles); replaced by the `build.make` reordering above.
-
-## Implementation notes
-
-- EDG runs in GNU mode (`--g++ --gnu_version=50000`).  Its predefined-macro
-  table is generated for clang, so the clang-gated entries are merged into the
-  gnu/gcc/gpp modes in a private copy of `base/`.
-- LLVM 5 predates CMake 4: `cmake_policy(SET CMP0051 OLD)` is rewritten to
-  `NEW` in the extracted source tree.
-- libc++ 5 expects glibc's `strtoll_l`/`strtoull_l`; musl has neither, so the
-  extracted copy uses `strtoll`/`strtoull` instead, and the build defines
-  `_LIBCPP_HAS_MUSL_LIBC` and `_LIBCPP_NO_EXCEPTIONS`.
-- LLVM uses `lseek64`; musl exposes it only with `_LARGEFILE64_SOURCE`, which
-  the scripts define for both EDG and the C compiler.
-- Stage 3b has no host gcc, hence no `crtbegin.o`: it links with
-  `-nostartfiles`, musl `crt1.o/crti.o/crtn.o`, a small `dso_handle.o`,
-  `-nodefaultlibs` and an explicit `--start-group` of libc++, EDG `libC.a`,
-  musl libc/libm/libpthread and the compiler-rt builtins.
-- With `ROOTFS=rootfs-hostclang`, `GCCINC` resolves to clang's resource
-  include directory (the same behaviour as `refhost-edg7.0.sh` on a
-  clang-built rootfs); it can be overridden through the environment.
-- All results are static and are checked for the absence of an `INTERP`
-  program header and of `GLIBC_` symbols.
+In both cases the self-hosted stage reports no host compiler and no host
+binutils, produces clang 3.9.1 + LLD 3.9, and the self-hosted clang compiles
+and links C and C++ programs by itself.

@@ -1,0 +1,21 @@
+--- a/libcxx/src/system_error.cpp
++++ b/libcxx/src/system_error.cpp
+@@ -81,15 +81,9 @@
+         // `ret` represents the error.
+         const int new_errno = ret == -1 ? errno : ret;
+         errno = old_errno;
+-        if (new_errno == EINVAL) {
+-            std::snprintf(buffer, strerror_buff_size, "Unknown error %d", ev);
+-            return string(buffer);
+-        } else {
+-            assert(new_errno == ERANGE);
+-            // FIXME maybe? 'strerror_buff_size' is likely to exceed the
+-            // maximum error size so ERANGE shouldn't be returned.
+-            std::abort();
+-        }
++        (void)new_errno;
++        std::snprintf(buffer, strerror_buff_size, "Unknown error %d", ev);
++        return string(buffer);
+     }
+     return string(buffer);
+ }
