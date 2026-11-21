@@ -31,7 +31,13 @@ stage0-posix => pnut => tcc => musl + tcc-musl
 
 `./prepare-rootfs.sh --arch {x86,amd64}`
 
-### onramp-pnut-tcc
+### onramp-cc
+
+#### onramp-tcc
+
+onramp => tinycc
+
+#### onramp-pnut-tcc
 
 For both x86 and amd64:
 
