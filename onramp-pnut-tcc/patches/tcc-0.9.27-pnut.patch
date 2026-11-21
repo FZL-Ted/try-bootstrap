@@ -1,0 +1,132 @@
+--- a/tcc-0.9.27/tccpp.c
++++ b/tcc-0.9.27/tccpp.c
+@@ -1805,7 +1805,11 @@
+         i = tok == TOK_INCLUDE_NEXT ? file->include_next_index : 0;
+         n = 2 + s1->nb_include_paths + s1->nb_sysinclude_paths;
+         for (; i < n; ++i) {
++#ifdef PNUT_CC
++            char buf1[1024];
++#else
+             char buf1[sizeof file->filename];
++#endif
+             CachedInclude *e;
+             const char *path;
+ 
+@@ -2375,7 +2379,9 @@
+             
+             /* now we can generate the number */
+             /* XXX: should patch directly float number */
++#ifdef HAVE_FLOAT
+             d = (double)bn[1] * 4294967296.0 + (double)bn[0];
++#endif
+             d = ldexp(d, exp_val - frac_bits);
+             t = toup(ch);
+             if (t == 'F') {
+--- a/tcc-0.9.27/tcc.h
++++ b/tcc-0.9.27/tcc.h
+@@ -92,6 +92,9 @@
+ #ifdef _MSC_VER
+ # define NORETURN __declspec(noreturn)
+ # define ALIGNED(x) __declspec(align(x))
++#elif defined(PNUT_CC)
++# define NORETURN
++# define ALIGNED(x)
+ #else
+ # define NORETURN __attribute__((noreturn))
+ # define ALIGNED(x) __attribute__((aligned(x)))
+@@ -431,6 +434,7 @@
+     			      result of unary() for an identifier. */
+ } SValue;
+ 
++#ifdef HAVE_BITFIELD
+ /* symbol attributes */
+ struct SymAttr {
+     unsigned short
+@@ -450,6 +454,26 @@
+     func_type   : 2, /* FUNC_OLD/NEW/ELLIPSIS */
+     func_args   : 8; /* PE __stdcall args */
+ };
++#else
++struct SymAttr {
++    unsigned short
++    aligned     ,
++    packed      ,
++    weak        ,
++    visibility  ,
++    dllexport   ,
++    dllimport   ,
++    unused      ;
++};
++
++/* function attributes or temporary attributes for parsing */
++struct FuncAttr {
++    unsigned
++    func_call   , /* calling convention (0..5), see below */
++    func_type   , /* FUNC_OLD/NEW/ELLIPSIS */
++    func_args   ; /* PE __stdcall args */
++};
++#endif // HAVE_BITFIELD
+ 
+ /* GNUC attribute definition */
+ typedef struct AttributeDef {
+--- a/tcc-0.9.27/tccgen.c
++++ b/tcc-0.9.27/tccgen.c
+@@ -2048,11 +2048,13 @@
+         case '-': f1 -= f2; break;
+         case '*': f1 *= f2; break;
+         case '/': 
++#if HAVE_FLOAT
+             if (f2 == 0.0) {
+                 if (const_wanted)
+                     tcc_error("division by zero in constant");
+                 goto general_case;
+             }
++#endif
+             f1 /= f2; 
+             break;
+             /* XXX: also handles tests ? */
+@@ -4953,13 +4955,15 @@
+ 	if (is_float(t)) {
+             /* In IEEE negate(x) isn't subtract(0,x), but rather
+ 	       subtract(-0, x).  */
+-	    vpush(&vtop->type);
++			vpush(&vtop->type);
++#if HAVE_FLOAT
+ 	    if (t == VT_FLOAT)
+ 	        vtop->c.f = -1.0 * 0.0;
+ 	    else if (t == VT_DOUBLE)
+ 	        vtop->c.d = -1.0 * 0.0;
+ 	    else
+ 	        vtop->c.ld = -1.0 * 0.0;
++#endif
+ 	} else
+ 	    vpushi(0);
+ 	vswap();
+@@ -6561,6 +6565,7 @@
+ 		*(double *)ptr = vtop->c.d;
+ 		break;
+ 	    case VT_LDOUBLE:
++#ifdef HAVE_FLOAT
+ #if defined TCC_IS_NATIVE_387
+                 if (sizeof (long double) >= 10) /* zero pad ten-byte LD */
+                     memcpy(ptr, &vtop->c.ld, 10);
+@@ -6578,6 +6583,7 @@
+ 		    *(double *)ptr = (double)vtop->c.ld;
+                 else
+                     tcc_error("can't cross compile long double constants");
++#endif // HAVE_FLOAT
+ 		break;
+ #if PTR_SIZE != 8
+ 	    case VT_LLONG:
+--- a/tcc-0.9.27/libtcc.c
++++ b/tcc-0.9.27/libtcc.c
+@@ -766,7 +766,8 @@
+     {
+         /* define __TINYC__ 92X  */
+         char buffer[32]; int a,b,c;
+-        sscanf(TCC_VERSION, "%d.%d.%d", &a, &b, &c);
++        // sscanf(TCC_VERSION, "%d.%d.%d", &a, &b, &c);
++        a = 0; b = 9; c = 27;
+         sprintf(buffer, "%d", a*10000 + b*100 + c);
+         tcc_define_symbol(s, "__TINYC__", buffer);
+     }

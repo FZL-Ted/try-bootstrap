@@ -1,0 +1,79 @@
+--- a/tcc-0.9.27/x86_64-gen.c
++++ b/tcc-0.9.27/x86_64-gen.c
+@@ -1195,9 +1195,16 @@
+ ST_FUNC int classify_x86_64_va_arg(CType *ty)
+ {
+     /* This definition must be synced with stdarg.h */
++#ifdef PNUT_CC
++    /* pnut doesn't support enum declarations in function bodies */
++    #define __va_gen_reg 0
++    #define __va_float_reg 1
++    #define __va_stack 2
++#else
+     enum __va_arg_type {
+         __va_gen_reg, __va_float_reg, __va_stack
+     };
++#endif
+     int size, align, reg_count;
+     X86_64_Mode mode = classify_x86_64_arg(ty, NULL, &size, &align, &reg_count);
+     switch (mode) {
+@@ -1241,7 +1248,17 @@
+     int nb_reg_args = 0;
+     int nb_sse_args = 0;
+     int sse_reg, gen_reg;
++#ifdef PNUT_CC
++    /* pnut doesn't support variable length arrays, so use a fixed size array
++       instead. TCC doesn't need to pass many arguments at once. */
++    #define ONSTACK_ARGS_MAX 256
++    static char _onstack[ONSTACK_ARGS_MAX];
++    char *onstack = _onstack;
++    if (nb_args > ONSTACK_ARGS_MAX)
++        tcc_error("too many function arguments (%d)", nb_args);
++#else
+     char _onstack[nb_args], *onstack = _onstack;
++#endif
+ 
+     /* calculate the number of integer/float register arguments, remember
+        arguments to be passed via stack (in onstack[]), and also remember
+--- a/tcc-0.9.27/tccelf.c
++++ b/tcc-0.9.27/tccelf.c
+@@ -1079,12 +1079,25 @@
+             }
+ 
+ #ifdef TCC_TARGET_X86_64
++  #ifdef CONFIG_TCCBOOT
++    /* Backport of TinyCC 05f6aa1ad: fix generation of statically linked
++       x86-64 executables. */
++            if ((type == R_X86_64_PLT32 || type == R_X86_64_PC32) &&
++                sym->st_shndx != SHN_UNDEF &&
++                (ELFW(ST_VISIBILITY)(sym->st_other) != STV_DEFAULT ||
++                 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL ||
++                 s1->output_type == TCC_OUTPUT_EXE)) {
++                rel->r_info = ELFW(R_INFO)(sym_index, R_X86_64_PC32);
++                continue;
++            }
++  #else
+             if ((type == R_X86_64_PLT32 || type == R_X86_64_PC32) &&
+                 (ELFW(ST_VISIBILITY)(sym->st_other) != STV_DEFAULT ||
+ 		 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL)) {
+                 rel->r_info = ELFW(R_INFO)(sym_index, R_X86_64_PC32);
+                 continue;
+             }
++  #endif
+ #endif
+             if (code_reloc(type)) {
+             jmp_slot:
+@@ -1837,7 +1850,13 @@
+         /* On X86 gdb 7.3 works in any case but gdb 6.6 will crash if SHF_ALLOC
+         checking is removed */
+ #else
++  #ifdef CONFIG_TCCBOOT
++        /* Backport of TinyCC 05f6aa1ad: fix generation of statically linked
++           x86-64 executables. */
++        if (s->reloc && (s != s1->got || s1->static_link))
++  #else
+         if (s->reloc && s != s1->got)
++  #endif
+         /* On X86_64 gdb 7.3 will crash if SHF_ALLOC checking is present */
+ #endif
+             relocate_section(s1, s);

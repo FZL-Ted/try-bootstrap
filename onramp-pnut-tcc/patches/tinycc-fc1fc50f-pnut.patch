@@ -1,0 +1,320 @@
+--- a/tcc.h
++++ b/tcc.h
+@@ -35,6 +35,11 @@
+ #include <string.h>
+ #include <errno.h>
+ #include <math.h>
++#ifdef PNUT_CC
++/* pnut's portable libc has no ldexpl; hex-float parsing is not used during
++   bootstrap, so map it to the double version. */
++# define ldexpl ldexp
++#endif
+ #include <fcntl.h>
+ #include <setjmp.h>
+ #include <time.h>
+@@ -120,6 +125,10 @@
+ # define NORETURN __declspec(noreturn)
+ # define ALIGNED(x) __declspec(align(x))
+ # define PRINTF_LIKE(x,y)
++#elif defined(PNUT_CC)
++# define NORETURN
++# define ALIGNED(x)
++# define PRINTF_LIKE(x,y)
+ #else
+ # define NORETURN __attribute__((noreturn))
+ # define ALIGNED(x) __attribute__((aligned(x)))
+@@ -463,7 +472,11 @@
+ } CType;
+ 
+ /* long double words on host(!) platform */
++#ifdef PNUT_CC
++#define LDOUBLE_WORDS 2
++#else
+ #define LDOUBLE_WORDS ((sizeof(long double)+3)/4)
++#endif
+ 
+ /* constant value */
+ typedef union CValue {
+@@ -497,6 +510,7 @@
+ } SValue;
+ 
+ /* symbol attributes */
++#ifdef HAVE_BITFIELD
+ struct SymAttr {
+     unsigned short
+     aligned     : 5, /* alignment as log2+1 (0 == unspecified) */
+@@ -523,6 +537,34 @@
+     func_alwinl : 1, /* always_inline */
+     xxxx        : 15;
+ };
++#else
++struct SymAttr {
++    unsigned short
++    aligned     ,
++    packed      ,
++    weak        ,
++    visibility  ,
++    dllexport   ,
++    nodecorate  ,
++    dllimport   ,
++    addrtaken   ,
++    nodebug     ,
++    xxxx        ;
++};
++
++/* function attributes or temporary attributes for parsing */
++struct FuncAttr {
++    unsigned
++    func_call   ,
++    func_type   ,
++    func_noreturn ,
++    func_ctor   ,
++    func_dtor   ,
++    func_args   ,
++    func_alwinl ,
++    xxxx        ;
++};
++#endif /* HAVE_BITFIELD */
+ 
+ /* symbol management */
+ typedef struct Sym {
+@@ -727,10 +769,17 @@
+     unsigned plt_offset;
+     int plt_sym;
+     int dyn_index;
++#ifdef HAVE_BITFIELD
+     unsigned char linker_sym:1;
+ #ifdef TCC_TARGET_ARM
+     unsigned char plt_thumb_stub:1;
+ #endif
++#else
++    unsigned char linker_sym;
++#ifdef TCC_TARGET_ARM
++    unsigned char plt_thumb_stub;
++#endif
++#endif
+ };
+ 
+ struct TCCState {
+@@ -1255,8 +1304,13 @@
+ PUB_FUNC int _tcc_error_noabort(const char *fmt, ...) PRINTF_LIKE(1,2);
+ PUB_FUNC NORETURN void _tcc_error(const char *fmt, ...) PRINTF_LIKE(1,2);
+ PUB_FUNC void _tcc_warning(const char *fmt, ...) PRINTF_LIKE(1,2);
++#ifdef PNUT_CC
++#define tcc_internal_error(msg) \
++    tcc_error("internal compiler error: %s", msg)
++#else
+ #define tcc_internal_error(msg) \
+     tcc_error("internal compiler error in %s:%d: %s", __FUNCTION__,__LINE__,msg)
++#endif
+ 
+ /* other utilities */
+ ST_FUNC void dynarray_add(void *ptab, int *nb_ptr, void *data);
+@@ -1958,6 +2012,13 @@
+ static inline void post_sem(TCCSem *p) {
+     dispatch_semaphore_signal(p->sem);
+ }
++#elif defined(PNUT_CC)
++/* pnut's portable libc has no <semaphore.h>.  The bootstrap TCC is
++   single-threaded, so locking is a no-op.  A real type is needed because
++   TCC_SEM(static rt_sem); must not expand to a bare ';'. */
++typedef struct { int init; int sem; } TCCSem;
++static inline void wait_sem(TCCSem *p) { (void)p; }
++static inline void post_sem(TCCSem *p) { (void)p; }
+ #else
+ #include <semaphore.h>
+ typedef struct { int init; sem_t sem; } TCCSem;
+@@ -1988,23 +2049,12 @@
+ #endif
+ /********************************************************/
+ 
+-#define text_section        TCC_STATE_VAR(text_section)
+-#define data_section        TCC_STATE_VAR(data_section)
+-#define rodata_section      TCC_STATE_VAR(rodata_section)
+-#define bss_section         TCC_STATE_VAR(bss_section)
+-#define common_section      TCC_STATE_VAR(common_section)
+-#define cur_text_section    TCC_STATE_VAR(cur_text_section)
+-#define bounds_section      TCC_STATE_VAR(bounds_section)
+-#define lbounds_section     TCC_STATE_VAR(lbounds_section)
+-#define symtab_section      TCC_STATE_VAR(symtab_section)
+-#define gnu_ext             TCC_STATE_VAR(gnu_ext)
++/* PNUT_CC: the state-variable aliases are defined below, after
++   TCC_STATE_VAR, without self-referential macro expansions. */
+ #define tcc_error_noabort   TCC_SET_STATE(_tcc_error_noabort)
+ #define tcc_error           TCC_SET_STATE(_tcc_error)
+ #define tcc_warning         TCC_SET_STATE(_tcc_warning)
+ 
+-#define total_idents        TCC_STATE_VAR(total_idents)
+-#define total_lines         TCC_STATE_VAR(total_lines)
+-#define total_bytes         TCC_STATE_VAR(total_bytes)
+ 
+ PUB_FUNC void tcc_enter_state(TCCState *s1);
+ PUB_FUNC void tcc_exit_state(TCCState *s1);
+@@ -2019,14 +2069,53 @@
+ 
+ #undef TCC_STATE_VAR
+ #undef TCC_SET_STATE
++#undef text_section
++#undef data_section
++#undef rodata_section
++#undef bss_section
++#undef common_section
++#undef cur_text_section
++#undef bounds_section
++#undef lbounds_section
++#undef symtab_section
++#undef gnu_ext
++#undef total_idents
++#undef total_lines
++#undef total_bytes
+ 
+ #ifdef USING_GLOBALS
+ # define TCC_STATE_VAR(sym) tcc_state->sym
+ # define TCC_SET_STATE(fn) fn
++# define text_section tcc_state->text_section
++# define data_section tcc_state->data_section
++# define rodata_section tcc_state->rodata_section
++# define bss_section tcc_state->bss_section
++# define common_section tcc_state->common_section
++# define cur_text_section tcc_state->cur_text_section
++# define bounds_section tcc_state->bounds_section
++# define lbounds_section tcc_state->lbounds_section
++# define symtab_section tcc_state->symtab_section
++# define gnu_ext tcc_state->gnu_ext
++# define total_idents tcc_state->total_idents
++# define total_lines tcc_state->total_lines
++# define total_bytes tcc_state->total_bytes
+ # undef USING_GLOBALS
+ # undef _tcc_error
+ #else
+ # define TCC_STATE_VAR(sym) s1->sym
+ # define TCC_SET_STATE(fn) (tcc_enter_state(s1),fn)
++# define text_section s1->text_section
++# define data_section s1->data_section
++# define rodata_section s1->rodata_section
++# define bss_section s1->bss_section
++# define common_section s1->common_section
++# define cur_text_section s1->cur_text_section
++# define bounds_section s1->bounds_section
++# define lbounds_section s1->lbounds_section
++# define symtab_section s1->symtab_section
++# define gnu_ext s1->gnu_ext
++# define total_idents s1->total_idents
++# define total_lines s1->total_lines
++# define total_bytes s1->total_bytes
+ # define _tcc_error use_tcc_error_noabort
+ #endif
+--- a/tccpp.c
++++ b/tccpp.c
+@@ -2360,10 +2360,14 @@
+ 
+             /* now we can generate the number */
+             /* XXX: should patch directly float number */
++#ifdef HAVE_FLOAT
+             d = (long double)bn[3] * 79228162514264337593543950336.0L +
+ 	        (long double)bn[2] * 18446744073709551616.0L +
+ 	        (long double)bn[1] * 4294967296.0L +
+ 	        (long double)bn[0];
++#else
++            d = 0;
++#endif
+             d = ldexpl(d, exp_val - frac_bits);
+             t = toup(ch);
+             if (t == 'F') {
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -2571,6 +2571,7 @@
+     /* currently, we cannot do computations with forward symbols */
+     c1 = (v1->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+     c2 = (v2->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
++#ifdef HAVE_FLOAT
+     if (c1 && c2) {
+         if (bt == VT_FLOAT) {
+             f1 = v1->c.f;
+@@ -2647,7 +2648,9 @@
+         } else {
+             v1->c.ld = f1;
+         }
+-    } else {
++    } else
++#endif
++    {
+     general_case:
+         if (op == TOK_NEG) {
+             gen_negf(op);
+--- a/tccdbg.c
++++ b/tccdbg.c
+@@ -79,7 +79,17 @@
+ #endif
+ };
+ 
++#ifdef PNUT_CC
++/* pnut cannot evaluate sizeof of a variable; the count is fixed for this
++   TCC revision (fc1fc50f), depending on the host long size. */
++# if LONG_SIZE == 4
++#  define N_DEFAULT_DEBUG 27
++# else
++#  define N_DEFAULT_DEBUG 29
++# endif
++#else
+ #define	N_DEFAULT_DEBUG	(sizeof (default_debug) / sizeof (default_debug[0]))
++#endif
+ 
+ /* dwarf debug */
+ 
+--- a/tccrun.c
++++ b/tccrun.c
+@@ -224,6 +224,10 @@
+ #elif defined(__OpenBSD__) || defined(__NetBSD__)  || defined(__FreeBSD__)
+     extern char **environ;
+     char **envp = environ;
++#elif defined(PNUT_CC)
++    /* pnut's portable libc has no environ; tcc -run is not used when
++       bootstrapping. */
++    char **envp = 0;
+ #else
+     char **envp = environ;
+ #endif
+@@ -250,10 +254,12 @@
+      * free fd, which is 0 after the initial fclose in freopen. windows too.
+      * to set stdin to the tty, use /dev/tty (posix) or con (windows).
+      */
++#ifndef PNUT_CC
+     if (s1->run_stdin && !freopen(s1->run_stdin, "r", stdin)) {
+         tcc_error_noabort("failed to reopen stdin from '%s'", s1->run_stdin);
+         return -1;
+     }
++#endif
+ 
+     errno = 0; /* clean errno value */
+     fflush(stdout);
+--- a/libtcc.h
++++ b/libtcc.h
+@@ -102,7 +102,7 @@
+ 
+ /* catch runtime exceptions (optionally limit backtraces at top_func),
+    when using tcc_set_options("-bt") and when not using tcc_run() */
+-LIBTCCAPI void *_tcc_setjmp(TCCState *s1, void *jmp_buf, void *top_func, void *longjmp);
++LIBTCCAPI void *_tcc_setjmp(TCCState *s1, void *jmpbuf, void *top_func, void *longjmp);
+ #define tcc_setjmp(s1,jb,f) setjmp(_tcc_setjmp(s1, jb, f, longjmp))
+ 
+ /* custom error printer for runtime exceptions. Returning 0 stops backtrace */
+--- a/x86_64-gen.c
++++ b/x86_64-gen.c
+@@ -1177,9 +1177,16 @@
+ ST_FUNC int classify_x86_64_va_arg(CType *ty)
+ {
+     /* This definition must be synced with stdarg.h */
++#ifdef PNUT_CC
++    /* pnut doesn't support enum declarations in function bodies */
++    #define __va_gen_reg 0
++    #define __va_float_reg 1
++    #define __va_stack 2
++#else
+     enum __va_arg_type {
+         __va_gen_reg, __va_float_reg, __va_stack
+     };
++#endif
+     int size, align, reg_count;
+     X86_64_Mode mode = classify_x86_64_arg(ty, NULL, &size, &align, &reg_count);
+     switch (mode) {

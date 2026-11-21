@@ -1,0 +1,14 @@
+--- a/pnut.c
++++ b/pnut.c
+@@ -1607,9 +1607,10 @@
+   }
+ }
+ 
+-#ifdef PNUT_CC
++#if defined(PNUT_CC) && !defined(PNUT_PORTABLE_LIBC)
+ 
+ // TODO: It would be nice to not have to duplicate this code
++// (Skipped when PNUT_PORTABLE_LIBC is set: the portable libc provides these.)
+ 
+ int strlen(char *str) {
+   int i = 0;

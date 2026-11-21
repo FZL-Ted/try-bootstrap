@@ -31,6 +31,13 @@ stage0-posix => pnut => tcc => musl + tcc-musl
 
 `./prepare-rootfs.sh --arch {x86,amd64}`
 
+### onramp-pnut-tcc
+
+For both x86 and amd64:
+
+onramp => pnut => tcc {0.9.27, fc1fc50f-20261120}
+
+See the README in that directory.
 
 ### xcc-to-gcc10
 
